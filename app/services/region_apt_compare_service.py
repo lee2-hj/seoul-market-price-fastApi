@@ -14,6 +14,26 @@ from app.core import duckdb_client
 MART_TABLE = "dm_apt_recent_trade"
 
 
+def _build_where_clause(
+    cgg_cd: str, bjd_cd: str, apt_nm: str, mno: str, sno: str
+) -> tuple[str, dict[str, str]]:
+    """자치구코드+법정동코드+아파트명+지번 본번/부번(모두 필수) 조건을 만든다.
+    _fetch_apt_row의 WHERE 절과 동일한 조건이며, base_date 매칭 여부 확인
+    (resolve_base_date_for_filter)과 실제 데이터 조회가 이 조건을 공유한다."""
+    params: dict[str, str] = {
+        "cgg_cd": cgg_cd,
+        "bjd_cd": bjd_cd,
+        "apt_nm": apt_nm,
+        "mno": mno,
+        "sno": sno,
+    }
+    where_clause = (
+        "WHERE sgg_cd = $cgg_cd AND dong_cd = $bjd_cd AND apt_name = $apt_nm"
+        " AND mno = $mno AND sno = $sno"
+    )
+    return where_clause, params
+
+
 def _fetch_apt_row(
     con,
     base_date: str,
@@ -49,11 +69,12 @@ def _fetch_apt_row(
     return rows[0] if rows else None
 
 
-def _build_group(row: dict[str, Any] | None) -> dict[str, Any]:
+def _build_group(row: dict[str, Any] | None, base_date: str) -> dict[str, Any]:
     """row를 응답용 비교 지표로 가공한다. avg_deal_price/avg_pyeong_price/avg_pyeong은 각각
     total_trade_amount/total_price_per_pyeong/total_pyeong을 trade_count로 나눠 반올림한 정수다.
     latest_trade_pyeong도 원본 값을 반올림한 정수로 전달한다. 매칭되는 row가 없거나(단지 자체를 못 찾음)
-    trade_count가 0이면(최근 90일간 거래 없음) 빈 딕셔너리({})를 반환한다."""
+    trade_count가 0이면(최근 90일간 거래 없음) 빈 딕셔너리({})를 반환한다(이 경우 base_date도
+    포함하지 않는다)."""
     trade_count = (row or {}).get("trade_count") or 0
     if row is None or trade_count == 0:
         return {}
@@ -68,6 +89,7 @@ def _build_group(row: dict[str, Any] | None) -> dict[str, Any]:
 
     return {
         "apt_name": row.get("apt_name"),
+        "base_date": base_date,
         "avg_deal_price": avg_deal_price,
         "avg_pyeong_price": avg_pyeong_price,
         "avg_pyeong": avg_pyeong,
@@ -96,13 +118,22 @@ def compare_region_apts(
     자치구코드+법정동코드+아파트명+지번 본번/부번(모두 필수)으로 특정해, 비교 지표(평균 매매가/평균 평당가/
     평균 전용면적/최근 거래 전용면적/거래건수)와 메타데이터(세대수/준공년도/사용승인일)를 조회한다. 두 단지
     조회는 서로 독립적이라 한쪽이 매칭되지 않아도(또는 최근 90일간 거래가 없어도, 빈 딕셔너리로) 나머지
-    한쪽은 정상적으로 반환된다."""
+    한쪽은 정상적으로 반환된다. base_date 또한 단지1/단지2가 서로 독립적으로 폴백 탐색하므로
+    (한쪽만 최신 파티션에 거래가 없으면 그 단지만 과거로 소급), 두 단지가 서로 다른 base_date를
+    가질 수 있다(정상 동작)."""
     con = duckdb_client.get_connection()
     try:
-        base_date = duckdb_client.resolve_base_date(con, MART_TABLE)
-        row_1 = _fetch_apt_row(con, base_date, cgg_cd_1, bjd_cd_1, apt_nm_1, mno_1, sno_1)
-        row_2 = _fetch_apt_row(con, base_date, cgg_cd_2, bjd_cd_2, apt_nm_2, mno_2, sno_2)
+        where_1, params_1 = _build_where_clause(cgg_cd_1, bjd_cd_1, apt_nm_1, mno_1, sno_1)
+        where_2, params_2 = _build_where_clause(cgg_cd_2, bjd_cd_2, apt_nm_2, mno_2, sno_2)
+        base_date_1 = duckdb_client.resolve_base_date_for_filter(
+            con, MART_TABLE, where_1, params_1
+        ) or duckdb_client.resolve_base_date(con, MART_TABLE)
+        base_date_2 = duckdb_client.resolve_base_date_for_filter(
+            con, MART_TABLE, where_2, params_2
+        ) or duckdb_client.resolve_base_date(con, MART_TABLE)
+        row_1 = _fetch_apt_row(con, base_date_1, cgg_cd_1, bjd_cd_1, apt_nm_1, mno_1, sno_1)
+        row_2 = _fetch_apt_row(con, base_date_2, cgg_cd_2, bjd_cd_2, apt_nm_2, mno_2, sno_2)
     finally:
         con.close()
 
-    return _build_group(row_1), _build_group(row_2)
+    return _build_group(row_1, base_date_1), _build_group(row_2, base_date_2)

@@ -1,0 +1,106 @@
+# test_rtt_service.py 명세
+
+## 1. 메타 정보
+
+| 항목 | 값 |
+|---|---|
+| source_path | backend_fastApi/tests/services/test_rtt_service.py |
+| source_sha256 | dc76b1a4ffadcbb939528295adf12b217106fe37a74a46e466300e0df9fcf9ee |
+| source_lines | 98 |
+
+## 2. 역할 요약
+
+`rtt_service.get_rtt_summary()`의 range-앵커형 base_date 폴백(90일 창 이동) — 나이브 창에 데이터가 없을 때 lookback 이내면 창 이동, lookback을 벗어나거나 매칭이 아예 없으면 빈 결과 유지, 나이브 창에 데이터가 있으면 폴백 함수를 호출하지 않음 — 을 검증하는 회귀 테스트다.
+
+모듈 docstring(원문): "rtt_service.get_rtt_summary()의 range-앵커형 base_date 폴백(90일 창 이동) 회귀 테스트."
+
+## 3. 외부 인터페이스
+
+| 이름 | 종류 | 시그니처 | 반환 타입 |
+|---|---|---|---|
+| test_get_rtt_summary_shifts_window_when_naive_period_has_no_matching_trades | function | `def test_get_rtt_summary_shifts_window_when_naive_period_has_no_matching_trades(monkeypatch, caplog)` | None |
+| test_get_rtt_summary_keeps_empty_result_when_match_exceeds_lookback | function | `def test_get_rtt_summary_keeps_empty_result_when_match_exceeds_lookback(monkeypatch)` | None |
+| test_get_rtt_summary_keeps_empty_result_when_no_match_at_all | function | `def test_get_rtt_summary_keeps_empty_result_when_no_match_at_all(monkeypatch)` | None |
+| test_get_rtt_summary_does_not_call_fallback_when_naive_window_has_rows | function | `def test_get_rtt_summary_does_not_call_fallback_when_naive_window_has_rows(monkeypatch)` | None |
+
+## 4. 의존성(imports)
+
+- 표준 라이브러리:
+  - `from __future__ import annotations`
+  - `import logging`
+  - `from datetime import date, timedelta`
+  - `from unittest.mock import MagicMock`
+- 서드파티: 없음
+- 내부 모듈:
+  - `from app.services import rtt_service`
+
+## 5. 로직 상세
+
+### test_get_rtt_summary_shifts_window_when_naive_period_has_no_matching_trades(monkeypatch, caplog)
+
+- 함수 docstring(원문): "나이브 90일 창에는 거래가 없고, lookback(기본 30일) 이내의 과거에 거래가 있으면 창을 그 시점으로 이동시켜 재조회해야 한다."
+- Given:
+  1. `monkeypatch.setattr(rtt_service.duckdb_client, "get_connection", lambda: MagicMock())`.
+  2. `call_count = {"n": 0}`.
+  3. `naive_start, _ = rtt_service._period_range(date.today())`.
+  4. `matched = naive_start - timedelta(days=15)`(주석: `# naive 창보다 과거이면서도 max_base_date_lookback(30일) 상한 이내인 날짜.`).
+  5. `fake_fetch_rows(con, sgg_cd, dong_cd, start_date, end_date)`: `call_count["n"] += 1`; `if call_count["n"] == 1: return []`(주석: `# 나이브 창: 거래 없음`); 아니면(주석: `# 이동된 창으로 재조회했을 때: 실제로 이동된 날짜 범위인지 확인`) `assert end_date == matched`; `assert start_date == matched - timedelta(days=rtt_service.PERIOD_DAYS - 1)`; `return [{"trade_count": 3, "trade_amount": 30000, "deal_date": matched.isoformat(), "sgg_nm": "강남구", "dong_nm": "역삼동", "apt_name": "테스트", "mno": "1", "sno": "0", "floor": 5, "pyeong": 25.0, "exclusive_area_m2": 82.6}]`.
+  6. `monkeypatch.setattr(rtt_service, "_fetch_rows", fake_fetch_rows)`.
+  7. `monkeypatch.setattr(rtt_service.duckdb_client, "resolve_recent_match_date", lambda *a, **k: matched)`.
+- When: `with caplog.at_level(logging.INFO, logger="app.services.rtt_service"): result = rtt_service.get_rtt_summary(sgg_cd="11680")`.
+- Then(원문 assert):
+  - `assert result["period_end"] == matched`
+  - `assert result["period_start"] == matched - timedelta(days=rtt_service.PERIOD_DAYS - 1)`
+  - `assert result["total_deal_cnt"] == 3`
+  - `assert any("Anchor fallback used" in r.message for r in caplog.records)`
+
+### test_get_rtt_summary_keeps_empty_result_when_match_exceeds_lookback(monkeypatch)
+
+- 함수 docstring(원문): "매칭된 날짜가 있어도 lookback 상한을 벗어나면 창을 이동하지 않고 빈 결과를 그대로 반환한다."
+- Given:
+  1. `monkeypatch.setattr(rtt_service.duckdb_client, "get_connection", lambda: MagicMock())`.
+  2. `monkeypatch.setattr(rtt_service, "_fetch_rows", lambda *a, **k: [])`.
+  3. `naive_start, _ = rtt_service._period_range(date.today())`.
+  4. `too_old = naive_start - timedelta(days=rtt_service.settings.max_base_date_lookback + 10)`.
+  5. `monkeypatch.setattr(rtt_service.duckdb_client, "resolve_recent_match_date", lambda *a, **k: too_old)`.
+- When: `result = rtt_service.get_rtt_summary(sgg_cd="11680")`.
+- Then(원문 assert):
+  - `expected_start, expected_end = rtt_service._period_range(date.today())`
+  - `assert result["total_deal_cnt"] == 0`
+  - `assert result["period_start"] == expected_start`
+  - `assert result["period_end"] == expected_end`
+
+### test_get_rtt_summary_keeps_empty_result_when_no_match_at_all(monkeypatch)
+
+- Given:
+  1. `monkeypatch.setattr(rtt_service.duckdb_client, "get_connection", lambda: MagicMock())`.
+  2. `monkeypatch.setattr(rtt_service, "_fetch_rows", lambda *a, **k: [])`.
+  3. `monkeypatch.setattr(rtt_service.duckdb_client, "resolve_recent_match_date", lambda *a, **k: None)`.
+- When: `result = rtt_service.get_rtt_summary(sgg_cd="00000")`.
+- Then(원문 assert):
+  - `assert result["total_deal_cnt"] == 0`
+  - `assert result["recent_trades"] == []`
+
+### test_get_rtt_summary_does_not_call_fallback_when_naive_window_has_rows(monkeypatch)
+
+- 함수 docstring(원문): "흔한 경우(나이브 90일 창에 이미 데이터가 있음)는 resolve_recent_match_date를 호출하지 않아야 한다(추가 비용 없음)."
+- Given:
+  1. `monkeypatch.setattr(rtt_service.duckdb_client, "get_connection", lambda: MagicMock())`.
+  2. `monkeypatch.setattr(rtt_service, "_fetch_rows", lambda *a, **k: [{"trade_count": 1, "trade_amount": 10000, "deal_date": "2026-08-30", "sgg_nm": "강남구", "dong_nm": "역삼동", "apt_name": "테스트", "mno": "1", "sno": "0", "floor": 5, "pyeong": 25.0, "exclusive_area_m2": 82.6}])`.
+  3. `called = {"n": 0}`.
+  4. `fail_if_called(*a, **k)`: `called["n"] += 1`; `return None`.
+  5. `monkeypatch.setattr(rtt_service.duckdb_client, "resolve_recent_match_date", fail_if_called)`.
+- When: `rtt_service.get_rtt_summary(sgg_cd="11680")`.
+- Then(원문 assert): `assert called["n"] == 0`.
+
+## 6. 모듈 레벨 상수/설정값
+
+없음.
+
+## 7. 역참조(이 파일을 사용하는 곳)
+
+- 없음(pytest가 자동 수집하는 테스트 모듈이며, 다른 소스 모듈이 import하지 않음).
+
+## 8. 재생성 지침
+
+> 위 내용을 근거로 `backend_fastApi/tests/services/test_rtt_service.py` 파일을 동일한 로직으로 재작성하라. 여기 명시되지 않은 세부 구현(변수명 스타일, 코드 포맷 등)은 기존 프로젝트 컨벤션(PEP 8, 저장소 내 동일 계층 파일들의 스타일)을 따른다.

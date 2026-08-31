@@ -85,6 +85,16 @@ class DashboardResponse(BaseModel):
     cgg_cd: str = Field(..., description="조회에 사용된 자치구코드(미지정 시 기본값 '11140')")
     period_start: date = Field(..., description="집계 기간 시작일(오늘 기준 90일 전)")
     period_end: date = Field(..., description="집계 기간 종료일(오늘)")
+    preference_base_date: str = Field(
+        ...,
+        description=(
+            "선호지역(cgg_cd) 필터 위젯 3종(preference_price_trend/preference_top_trading_dongs/"
+            "preference_top_trading_apts)에 실제 사용된 base_date. 이 지역 조건에 매칭되는 데이터가 "
+            "최신 파티션에 없으면 과거 파티션으로 소급될 수 있다. 필터 없는 2개 위젯"
+            "(seoul_top5_districts/price_change_top5)은 항상 최신 파티션(나이브 최신 base_date)을 "
+            "사용하므로 이 필드와 다를 수 있다."
+        ),
+    )
 
     seoul_top5_districts: list[DistrictAvgPriceItem] = Field(
         default_factory=list, description="서울시 전체 자치구별 평균 매매가 Top5(자치구 필터 없음)"

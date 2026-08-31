@@ -19,13 +19,19 @@ def get_dong_pyeong_compare(
 ) -> DongPyeongCompareResponse:
     """프론트가 선택한 지역1/지역2(자치구코드+법정동코드)의 동 단위 평균 시세를 MinIO Parquet에서 동적 조회한다."""
     try:
-        base_date, region1_items, region2_items, region1_summary, region2_summary = (
-            mart_service.compare_dong_pyeong(
-                region1_cgg_cd=query.region1_cgg_cd,
-                region1_stdg_cd=query.region1_stdg_cd,
-                region2_cgg_cd=query.region2_cgg_cd,
-                region2_stdg_cd=query.region2_stdg_cd,
-            )
+        (
+            base_date,
+            region1_base_date,
+            region2_base_date,
+            region1_items,
+            region2_items,
+            region1_summary,
+            region2_summary,
+        ) = mart_service.compare_dong_pyeong(
+            region1_cgg_cd=query.region1_cgg_cd,
+            region1_stdg_cd=query.region1_stdg_cd,
+            region2_cgg_cd=query.region2_cgg_cd,
+            region2_stdg_cd=query.region2_stdg_cd,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -41,6 +47,7 @@ def get_dong_pyeong_compare(
         region1=RegionCompareResult(
             cgg_cd=query.region1_cgg_cd,
             stdg_cd=query.region1_stdg_cd,
+            base_date=region1_base_date,
             total_count=region1_total_count,
             avg_thing_amt=region1_avg_thing_amt,
             avg_pyeong_amt=region1_avg_pyeong_amt,
@@ -50,6 +57,7 @@ def get_dong_pyeong_compare(
         region2=RegionCompareResult(
             cgg_cd=query.region2_cgg_cd,
             stdg_cd=query.region2_stdg_cd,
+            base_date=region2_base_date,
             total_count=region2_total_count,
             avg_thing_amt=region2_avg_thing_amt,
             avg_pyeong_amt=region2_avg_pyeong_amt,

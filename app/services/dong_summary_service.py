@@ -64,10 +64,14 @@ def get_dong_summary(
     *, region_cgg: str | None
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     """region_cgg가 없으면 cgg_cd끼리, 있으면 해당 자치구 내 데이터를 stdg_cd끼리 그룹화하여
-    그룹별 집계(total_count/avg_thing_amt/avg_pyeong_amt)를 반환한다."""
+    그룹별 집계(total_count/avg_thing_amt/avg_pyeong_amt)를 반환한다. base_date는 최신 파티션만
+    보는 것이 아니라, 조건에 맞는 데이터가 있는 가장 최근 base_date까지 소급 조회한다."""
     con = duckdb_client.get_connection()
     try:
-        base_date = duckdb_client.resolve_base_date(con, MART_TABLE)
+        where_clause, where_params = _build_where_clause(region_cgg)
+        base_date = duckdb_client.resolve_base_date_for_filter(
+            con, MART_TABLE, where_clause, where_params
+        ) or duckdb_client.resolve_base_date(con, MART_TABLE)
         rows = _fetch_rows(con, base_date, region_cgg)
         if region_cgg:
             groups = _group_rows(rows, "stdg_cd", "stdg_nm")

@@ -1,8 +1,10 @@
+import logging
 from collections import OrderedDict
 from datetime import date, timedelta
 from typing import Any
 
 from app.core import duckdb_client
+from app.core.config import settings
 
 MART_TABLE = "RTT"
 PERIOD_DAYS = 90
@@ -11,9 +13,13 @@ BIWEEKLY_BUCKET_COUNT = 6
 RECENT_TRADES_LIMIT = 20
 TOP_VOLUME_LIMIT = 5
 
+logger = logging.getLogger(__name__)
+
 
 def _period_range(today: date) -> tuple[date, date]:
-    """오늘을 기준으로 최근 90일(오늘 포함) 구간의 시작일/종료일을 반환한다."""
+    """오늘을 기준(anchor)으로 최근 90일(오늘 포함) 구간의 시작일/종료일을 반환한다. 이 나이브 구간에
+    조건에 맞는 거래가 없으면 get_rtt_summary()가 anchor를 과거로 이동시킬 수 있으므로, 최종 응답의
+    period_start/period_end가 항상 이 함수의 반환값(오늘 기준)과 같다고 가정하면 안 된다."""
     end_date = today
     start_date = end_date - timedelta(days=PERIOD_DAYS - 1)
     return start_date, end_date
@@ -185,12 +191,48 @@ def _build_top5_by_volume(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def get_rtt_summary(*, sgg_cd: str, dong_cd: str | None = None) -> dict[str, Any]:
-    """오늘 기준 최근 90일간 sgg_cd(+dong_cd, 선택) 조건의 RTT(실거래) 데이터를 집계하여 단일 JSON으로 반환한다.
-    dong_cd가 없으면 자치구 내 모든 법정동의 거래내역을 대상으로 동일한 로직을 그대로 적용해 합산한다."""
+    """기본적으로 오늘 기준 최근 90일간 sgg_cd(+dong_cd, 선택) 조건의 RTT(실거래) 데이터를 집계하여 단일
+    JSON으로 반환한다. dong_cd가 없으면 자치구 내 모든 법정동의 거래내역을 대상으로 동일한 로직을 그대로
+    적용해 합산한다.
+
+    이 90일 창(오늘 기준)에 조건에 맞는 거래가 하나도 없으면(예: 최근에 거래가 뜸한 지역), 파티션을 하나씩
+    확인하는 대신 날짜 범위 제한 없이 전체 이력에서 조건에 매칭되는 가장 최근 base_date를 한 번에 찾아
+    (`resolve_recent_match_date`), 그 날짜를 새 end_date로 삼아 90일 창 전체를 그 시점으로 이동시켜
+    재조회한다("파티션 폴백"이 아니라 "조회 창의 기준일(anchor) 이동"). 이동된 시작일이 원래 창의
+    시작일보다 settings.max_base_date_lookback일 이상 더 과거이거나, 애초에 그 조건의 거래가 이력 전체에
+    없으면 창을 이동하지 않고 기존처럼 빈 결과를 그대로 반환한다(에러 아님). 창이 실제로 이동된 경우
+    period_start/period_end는 "오늘 기준 90일"이 아니라 이동된 실제 구간을 반영한다."""
     start_date, end_date = _period_range(date.today())
     con = duckdb_client.get_connection()
     try:
         rows = _fetch_rows(con, sgg_cd, dong_cd, start_date, end_date)
+
+        if not rows:
+            naive_start, naive_end = start_date, end_date
+            match_where = "WHERE sgg_cd = $sgg_cd" + (" AND dong_cd = $dong_cd" if dong_cd else "")
+            match_params: dict[str, Any] = {"sgg_cd": sgg_cd, **({"dong_cd": dong_cd} if dong_cd else {})}
+            full_glob = f"{duckdb_client.mart_base_path(MART_TABLE)}/base_date=*/data.parquet"
+            matched_date = duckdb_client.resolve_recent_match_date(
+                con, full_glob, "base_date", match_where, match_params
+            )
+            if matched_date is not None and matched_date >= start_date - timedelta(
+                days=settings.max_base_date_lookback
+            ):
+                end_date = matched_date
+                start_date = end_date - timedelta(days=PERIOD_DAYS - 1)
+                rows = _fetch_rows(con, sgg_cd, dong_cd, start_date, end_date)
+                logger.info(
+                    "Anchor fallback used for table=%s, condition_summary=%s, "
+                    "naive_window=%s~%s, matched_window=%s~%s",
+                    MART_TABLE,
+                    match_where[:100],
+                    naive_start,
+                    naive_end,
+                    start_date,
+                    end_date,
+                )
+            # matched_date가 없거나 lookback 상한을 넘으면 rows/기간은 나이브 값 그대로 —
+            # 기존과 동일하게 빈 결과 반환(에러 아님).
     finally:
         con.close()
 

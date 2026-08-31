@@ -26,6 +26,7 @@ class RegionAptCompareItem(BaseModel):
     빈 객체({})가 내려간다(RegionAptCompareResponse.aptGroup1/aptGroup2 참고)."""
 
     apt_name: str = Field(..., description="아파트명")
+    base_date: str = Field(..., description="이 단지 조회에 실제 사용된 base_date")
     avg_deal_price: int = Field(..., description="최근 90일 평균 매매가(만원, 반올림한 정수)")
     avg_pyeong_price: int = Field(..., description="최근 90일 평균 평당가(만원, 반올림한 정수)")
     avg_pyeong: int = Field(..., description="최근 90일 평균 거래 전용면적(평, 반올림한 정수)")

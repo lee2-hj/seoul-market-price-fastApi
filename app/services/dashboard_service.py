@@ -189,9 +189,21 @@ def _build_top_trading_apts(con, latest_base_date: str, cgg_cd: str) -> list[dic
     return duckdb_client.rows_to_dicts(con.execute(query, {"cgg_cd": cgg_cd}))
 
 
+def _build_preference_where_clause(cgg_cd: str) -> tuple[str, dict[str, str]]:
+    """선호지역 필터 3개 위젯(가격 추이/거래량 상위 법정동/거래량 상위 아파트)이 공통으로 쓰는
+    cgg_cd 조건. resolve_base_date_for_filter로 이 지역에 실제 매칭 데이터가 있는 base_date를
+    찾을 때 재사용한다."""
+    return "WHERE cgg_cd = $cgg_cd", {"cgg_cd": cgg_cd}
+
+
 def get_dashboard(*, cgg_cd: str | None) -> dict[str, Any]:
     """dm_main 마트(최근 90일)를 기준으로 대시보드 6개 위젯을 단일 JSON으로 반환한다.
-    cgg_cd가 없거나 빈 값이면 '서울시 중구'(11140)로 대체한다."""
+    cgg_cd가 없거나 빈 값이면 '서울시 중구'(11140)로 대체한다. 6개 위젯 중 필터가 없는 2개
+    (seoul_top5_districts/price_change_top5)는 latest_base_date(파티션 존재 여부 폴백)를 그대로
+    쓰고, resolved_cgg_cd로 필터링하는 3개(preference_price_trend/preference_top_trading_dongs/
+    preference_top_trading_apts)만 그 지역 조건 기준으로 별도 폴백한 preference_base_date를
+    사용한다 — 최신 파티션엔 그 지역 데이터가 없어도 과거 파티션엔 있을 수 있기 때문이다(compare
+    계열 비교형 API와 동일한 "위젯 그룹별로 다른 base_date를 가질 수 있다"는 원리)."""
     resolved_cgg_cd = cgg_cd.strip() if cgg_cd and cgg_cd.strip() else DEFAULT_CGG_CD
     today = date.today()
     start_date, end_date = _period_range(today)
@@ -200,11 +212,16 @@ def get_dashboard(*, cgg_cd: str | None) -> dict[str, Any]:
     try:
         latest_base_date = duckdb_client.resolve_base_date(con, MART_TABLE)
 
+        preference_where, preference_params = _build_preference_where_clause(resolved_cgg_cd)
+        preference_base_date = duckdb_client.resolve_base_date_for_filter(
+            con, MART_TABLE, preference_where, preference_params
+        ) or latest_base_date
+
         seoul_top5_districts = _build_seoul_top5_districts(con, latest_base_date)
         price_change_top5 = _build_price_change_top5(con, latest_base_date)
-        preference_price_trend = _build_preference_price_trend(con, latest_base_date, resolved_cgg_cd, today)
-        preference_top_trading_dongs = _build_top_trading_dongs(con, latest_base_date, resolved_cgg_cd)
-        preference_top_trading_apts = _build_top_trading_apts(con, latest_base_date, resolved_cgg_cd)
+        preference_price_trend = _build_preference_price_trend(con, preference_base_date, resolved_cgg_cd, today)
+        preference_top_trading_dongs = _build_top_trading_dongs(con, preference_base_date, resolved_cgg_cd)
+        preference_top_trading_apts = _build_top_trading_apts(con, preference_base_date, resolved_cgg_cd)
     finally:
         con.close()
 
@@ -221,6 +238,7 @@ def get_dashboard(*, cgg_cd: str | None) -> dict[str, Any]:
         "cgg_cd": resolved_cgg_cd,
         "period_start": start_date,
         "period_end": end_date,
+        "preference_base_date": preference_base_date,
         "seoul_top5_districts": seoul_top5_districts,
         "price_change_top5": price_change_top5,
         "preference_price_trend": preference_price_trend,

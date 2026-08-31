@@ -85,8 +85,8 @@ class AptTrendData(BaseModel):
         description=(
             "biweekly_trend의 인접한 구간 간 deal_count 증감률(%)을, 오래된 스텝부터 1,2,3,...로 "
             "선형 증가하는 가중치(최신 스텝일수록 가중치가 높음)로 가중평균해 반올림한 정수값이다. "
-            "스텝 양쪽 구간 중 하나라도 거래건수가 3(MIN_TRADE_COUNT) 미만이면 해당 스텝은 제외되며, "
-            "유효한 스텝이 하나도 없으면 산출 불가로 null을 반환한다."
+            "이전 구간의 거래건수가 0이면(증감률 계산 불가) 해당 스텝만 제외되며, 계산 가능한 스텝이 "
+            "하나도 없으면(마지막 구간을 제외한 나머지 구간 전부 거래 0건) null을 반환한다."
         ),
     )
     biweekly_trend: list[BiweeklyTrendItem] = Field(
@@ -100,8 +100,18 @@ class AptTrendData(BaseModel):
 
 
 class SearchPeriod(BaseModel):
-    start_date: date = Field(..., description="조회 시작일(오늘 기준 90일 전)")
-    end_date: date = Field(..., description="조회 종료일(오늘)")
+    start_date: date = Field(
+        ...,
+        description=(
+            "조회 시작일. 기본은 오늘 기준 90일 전이지만, 그 구간에 조건에 맞는 거래가 없으면 조건에 "
+            "맞는 데이터가 있는 가장 최근 날짜 기준 90일 구간으로 소급될 수 있다(이 경우 오늘 기준이 "
+            "아니다)."
+        ),
+    )
+    end_date: date = Field(
+        ...,
+        description="조회 종료일. 기본은 오늘이지만, start_date와 마찬가지로 소급이 일어나면 오늘이 아닐 수 있다.",
+    )
 
 
 class AptTrendResponse(BaseModel):

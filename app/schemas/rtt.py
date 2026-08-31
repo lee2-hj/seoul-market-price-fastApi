@@ -79,8 +79,21 @@ class RttSummaryResponse(BaseModel):
     dong_nm: str | None = Field(
         default=None, description="법정동명. dong_cd 미지정 시(자치구 전체 집계) null"
     )
-    period_start: date = Field(..., description="집계 기간 시작일(오늘 기준 90일 전)")
-    period_end: date = Field(..., description="집계 기간 종료일(오늘)")
+    period_start: date = Field(
+        ...,
+        description=(
+            "집계 기간 시작일. 기본은 오늘 기준 90일 전이지만, 그 구간에 조건에 맞는 거래가 없으면 "
+            "조건에 맞는 데이터가 있는 가장 최근 날짜 기준 90일 구간으로 소급될 수 있다(이 경우 오늘 "
+            "기준이 아니다)."
+        ),
+    )
+    period_end: date = Field(
+        ...,
+        description=(
+            "집계 기간 종료일. 기본은 오늘이지만, period_start와 마찬가지로 소급이 일어나면 오늘이 "
+            "아닐 수 있다."
+        ),
+    )
 
     total_deal_cnt: int = Field(..., description="기간 내 일자들의 거래건수 총합")
     total_trade_amount: int = Field(..., description="기간 내 거래건수 총 거래금액")

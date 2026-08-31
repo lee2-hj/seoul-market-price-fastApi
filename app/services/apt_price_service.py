@@ -115,10 +115,14 @@ def get_top_bottom(
     *, region_cgg_cd: str | None, region_stdg_cd: str | None, metric_type: str
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], int, int, int]:
     """지정된(선택적) 지역 조건 내 아파트별 metric_type 기준(평균 평당가 또는 평균 거래가) 상위/하위 5개와
-    전체 집계(총 거래건수/평균 거래금액/평균 평당가)를 MinIO Parquet에서 동적으로 조회한다."""
+    전체 집계(총 거래건수/평균 거래금액/평균 평당가)를 MinIO Parquet에서 동적으로 조회한다. base_date는
+    최신 파티션만 보는 것이 아니라, 조건에 맞는 데이터가 있는 가장 최근 base_date까지 소급 조회한다."""
     con = duckdb_client.get_connection()
     try:
-        base_date = duckdb_client.resolve_base_date(con, MART_TABLE)
+        where_clause, where_params = _build_where_clause(region_cgg_cd, region_stdg_cd)
+        base_date = duckdb_client.resolve_base_date_for_filter(
+            con, MART_TABLE, where_clause, where_params
+        ) or duckdb_client.resolve_base_date(con, MART_TABLE)
         row_count = _count_rows(con, base_date, region_cgg_cd, region_stdg_cd)
         top_items = _fetch_ranked(con, base_date, region_cgg_cd, region_stdg_cd, metric_type, "DESC")
         bottom_items = (

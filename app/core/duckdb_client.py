@@ -1,3 +1,4 @@
+import logging
 import re
 from datetime import date, datetime
 from decimal import Decimal
@@ -8,6 +9,8 @@ import duckdb
 from app.core.config import settings
 
 _PARTITION_PATTERN = re.compile(r"year=(\d{4})/month=(\d{2})/day=(\d{2})")
+
+logger = logging.getLogger(__name__)
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
@@ -28,15 +31,11 @@ def mart_base_path(mart_table: str) -> str:
     return f"s3://{settings.lake}/mart/{mart_table}"
 
 
-def resolve_base_date(con: duckdb.DuckDBPyConnection, mart_table: str) -> str:
-    """배치 당일 파티션을 우선 조회하고, 없으면 최신(MAX) base_date 파티션을 선택한다."""
-    today_str = date.today().isoformat()
+def list_base_dates(con: duckdb.DuckDBPyConnection, mart_table: str) -> list[str]:
+    """mart_table에 존재하는 모든 base_date 파티션명을 최신순(내림차순)으로 정렬해 반환한다.
+    resolve_base_date()와 resolve_base_date_for_filter()가 공통으로 사용하는 파티션 목록
+    조회 로직이다. 파티션이 하나도 없으면 FileNotFoundError."""
     base_path = mart_base_path(mart_table)
-
-    today_pattern = f"{base_path}/base_date={today_str}/*.parquet"
-    if con.execute("SELECT COUNT(*) FROM glob($pattern)", {"pattern": today_pattern}).fetchone()[0] > 0:
-        return today_str
-
     all_pattern = f"{base_path}/base_date=*/*.parquet"
     paths = con.execute("SELECT file FROM glob($pattern)", {"pattern": all_pattern}).fetchall()
     if not paths:
@@ -53,7 +52,72 @@ def resolve_base_date(con: duckdb.DuckDBPyConnection, mart_table: str) -> str:
 
     if not available_dates:
         raise FileNotFoundError(f"'{mart_table}' 마트 경로에서 base_date 파티션명을 파싱하지 못했습니다.")
-    return max(available_dates)
+    return sorted(available_dates, reverse=True)
+
+
+def resolve_base_date(con: duckdb.DuckDBPyConnection, mart_table: str) -> str:
+    """배치 당일 파티션을 우선 조회하고, 없으면 최신(MAX) base_date 파티션을 선택한다."""
+    today_str = date.today().isoformat()
+    base_path = mart_base_path(mart_table)
+
+    today_pattern = f"{base_path}/base_date={today_str}/*.parquet"
+    if con.execute("SELECT COUNT(*) FROM glob($pattern)", {"pattern": today_pattern}).fetchone()[0] > 0:
+        return today_str
+
+    return list_base_dates(con, mart_table)[0]
+
+
+def resolve_base_date_for_filter(
+    con: duckdb.DuckDBPyConnection,
+    mart_table: str,
+    where_sql: str,
+    params: dict[str, Any],
+    *,
+    max_lookback: int | None = None,
+) -> str | None:
+    """요청의 조회 조건(where_sql/params)에 매칭되는 row가 1건 이상 존재하는 가장 최근
+    base_date를 찾는다. 파티션 존재 여부만 보는 resolve_base_date()와 달리, 실제 조건에
+    매칭되는 데이터가 있는지까지 확인한다.
+
+    최신 base_date부터 내림차순으로 최대 max_lookback개(생략 시
+    settings.max_base_date_lookback) 파티션까지 `SELECT EXISTS(...LIMIT 1)` 형태의 가벼운
+    쿼리로 순차 확인하며, 매칭되는 첫 base_date를 즉시 반환한다(조기 종료). 흔한 경우(최신
+    파티션에 이미 데이터가 있음)는 쿼리 1회로 끝난다.
+
+    max_lookback개를 모두 확인해도 매칭 데이터가 없으면 None을 반환한다(예외를 던지지
+    않음 — 호출자가 기존 resolve_base_date()의 결과로 폴백해 빈 결과를 반환해야 한다).
+    """
+    candidates = list_base_dates(con, mart_table)
+    naive_latest = candidates[0]
+    lookback = max_lookback if max_lookback is not None else settings.max_base_date_lookback
+    base_path = mart_base_path(mart_table)
+
+    checked = 0
+    for candidate in candidates[:lookback]:
+        checked += 1
+        glob_pattern = f"{base_path}/base_date={candidate}/*.parquet"
+        query = f"""
+            SELECT EXISTS(
+                SELECT 1 FROM read_parquet($glob, hive_partitioning = true)
+                {where_sql}
+                LIMIT 1
+            )
+        """
+        query_params = {**params, "glob": glob_pattern}
+        matched = con.execute(query, query_params).fetchone()[0]
+        if matched:
+            if candidate != naive_latest:
+                logger.info(
+                    "Fallback used for table=%s, condition_summary=%s, "
+                    "final_base_date=%s, lookback_partitions_checked=%d",
+                    mart_table,
+                    (where_sql or "(no filter)")[:100],
+                    candidate,
+                    checked,
+                )
+            return candidate
+
+    return None
 
 
 def raw_base_path(dataset: str) -> str:
@@ -85,6 +149,93 @@ def resolve_latest_date_partition(con: duckdb.DuckDBPyConnection, dataset: str) 
     if not partitions:
         raise FileNotFoundError(f"'{dataset}' 데이터셋 경로에서 year/month/day 파티션명을 파싱하지 못했습니다.")
     return max(partitions)
+
+
+def resolve_latest_date_partition_for_filter(
+    con: duckdb.DuckDBPyConnection,
+    dataset: str,
+    where_sql: str,
+    params: dict[str, Any],
+    *,
+    max_lookback: int | None = None,
+) -> tuple[str, str, str] | None:
+    """RAW 버킷(year=/month=/day= 파티션)에서 where_sql/params 조건에 매칭되는 row가 1건
+    이상 존재하는 가장 최근 (year, month, day)를 찾는다. resolve_base_date_for_filter의
+    RAW 데이터셋 버전이며, 동작 원리(조기 종료/최대 max_lookback개/미매칭 시 None 반환/
+    폴백 발생 시에만 로깅)는 동일하다. 파티션 자체가 하나도 없으면(=폴더 자체가 비어있음)
+    resolve_latest_date_partition()과 동일하게 FileNotFoundError를 던진다."""
+    base_path = raw_base_path(dataset)
+    all_pattern = f"{base_path}/year=*/month=*/day=*/*.parquet"
+    paths = con.execute("SELECT file FROM glob($pattern)", {"pattern": all_pattern}).fetchall()
+    if not paths:
+        raise FileNotFoundError(f"'{dataset}' 데이터셋에서 조회 가능한 year/month/day 파티션을 찾을 수 없습니다.")
+
+    partitions: set[tuple[str, str, str]] = set()
+    for (path,) in paths:
+        match = _PARTITION_PATTERN.search(path)
+        if match:
+            partitions.add(match.groups())
+    if not partitions:
+        raise FileNotFoundError(f"'{dataset}' 데이터셋 경로에서 year/month/day 파티션명을 파싱하지 못했습니다.")
+
+    candidates = sorted(partitions, reverse=True)
+    naive_latest = candidates[0]
+    lookback = max_lookback if max_lookback is not None else settings.max_base_date_lookback
+
+    checked = 0
+    for candidate in candidates[:lookback]:
+        checked += 1
+        year, month, day = candidate
+        glob_pattern = f"{base_path}/year={year}/month={month}/day={day}/*.parquet"
+        query = f"""
+            SELECT EXISTS(
+                SELECT 1 FROM read_parquet($glob, hive_partitioning = true)
+                {where_sql}
+                LIMIT 1
+            )
+        """
+        query_params = {**params, "glob": glob_pattern}
+        matched = con.execute(query, query_params).fetchone()[0]
+        if matched:
+            if candidate != naive_latest:
+                logger.info(
+                    "Fallback used for dataset=%s, condition_summary=%s, "
+                    "final_partition=year=%s/month=%s/day=%s, lookback_partitions_checked=%d",
+                    dataset,
+                    (where_sql or "(no filter)")[:100],
+                    year,
+                    month,
+                    day,
+                    checked,
+                )
+            return candidate
+
+    return None
+
+
+def resolve_recent_match_date(
+    con: duckdb.DuckDBPyConnection,
+    glob_pattern: str,
+    date_column: str,
+    where_sql: str,
+    params: dict[str, Any],
+) -> date | None:
+    """range-앵커형(apt_trend_service/rtt_service) 전용: 파티션을 하나씩 순회하지 않고,
+    날짜 범위 제한 없이 전체 이력에서 where_sql/params 조건에 매칭되는 가장 최근
+    date_column 값을 단일 `SELECT MAX(date_column)` 집계 쿼리로 찾는다. 비용이 파티션
+    개수와 무관하게 일정하다(resolve_base_date_for_filter와 달리 조기 종료할 것도 없이
+    쿼리 1회로 끝남). 매칭되는 row가 하나도 없으면 None을 반환한다. 이 함수 자체는
+    로깅하지 않는다 — 호출자가 "나이브 조회 0건 → 이 함수 호출 → 창 이동" 흐름 전체를
+    판단할 수 있으므로, 실제로 창이 이동된 경우의 로깅은 호출부(rtt_service/
+    apt_trend_service)에서 수행한다."""
+    query = f"""
+        SELECT MAX({date_column})
+        FROM read_parquet($glob, hive_partitioning = true)
+        {where_sql}
+    """
+    query_params = {**params, "glob": glob_pattern}
+    row = con.execute(query, query_params).fetchone()
+    return row[0] if row and row[0] is not None else None
 
 
 def to_json_safe(value: Any) -> Any:

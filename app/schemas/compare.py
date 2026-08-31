@@ -15,6 +15,7 @@ class RegionCompareResult(BaseModel):
 
     cgg_cd: str = Field(..., description="요청받은 자치구코드")
     stdg_cd: str | None = Field(default=None, description="요청받은 법정동코드")
+    base_date: str = Field(..., description="이 지역 조회에 실제 사용된 base_date")
     total_count: int = Field(..., description="해당 지역의 전체 거래건수 합계")
     avg_thing_amt: int = Field(..., description="해당 지역의 평균 매매가(SUM(total_thing_amt) / total_count, 반올림)")
     avg_pyeong_amt: int = Field(..., description="해당 지역의 평균 평당가(SUM(total_pyeong_amt) / total_count, 반올림)")
@@ -25,6 +26,13 @@ class RegionCompareResult(BaseModel):
 class DongPyeongCompareResponse(BaseModel):
     """`GET /api/v1/compare/dong-pyeong` 응답 스키마."""
 
-    base_date: str = Field(..., description="실제 조회에 사용된 mart 파티션의 base_date")
+    base_date: str = Field(
+        ...,
+        description=(
+            "하위 호환용 대표 base_date(region1.base_date/region2.base_date 중 더 최신 날짜). "
+            "지역1/지역2는 서로 다른 base_date로 소급될 수 있으므로 정확한 값이 필요하면 "
+            "region1.base_date/region2.base_date를 사용할 것"
+        ),
+    )
     region1: RegionCompareResult
     region2: RegionCompareResult

@@ -7,13 +7,18 @@ PYEONG_DIVISOR = 3.305785
 
 
 def get_latest_listings() -> tuple[str, list[dict[str, Any]]]:
-    """RAW 버킷의 real_estate 데이터셋에서 오늘(없으면 가장 최근) 파티션의 아파트별 최신 실거래 목록을 조회한다.
-    BLDG_USG = '아파트'인 row만 대상으로 하며(연립다세대/오피스텔/단독다가구 등은 제외), 같은 날 동일
-    건물(자치구+법정동+지번+건물명)의 거래가 여러 건이면 매매가/평당가는 평균값으로 집계한다. price_change는
-    같은 건물의 가장 최근 이전 거래일(과거 전체 파티션 중, 아파트 거래만) 대비 매매가 변동(만원)이다."""
+    """RAW 버킷의 real_estate 데이터셋에서, BLDG_USG = '아파트' 조건에 매칭되는 row가 있는 가장 최근
+    (year, month, day) 파티션의 아파트별 최신 실거래 목록을 조회한다(오늘 파티션에 아파트 거래가 없으면
+    조건에 맞는 데이터가 있는 과거 파티션까지 소급). 같은 날 동일 건물(자치구+법정동+지번+건물명)의 거래가
+    여러 건이면 매매가/평당가는 평균값으로 집계한다. price_change는 같은 건물의 가장 최근 이전 거래일
+    (과거 전체 파티션 중, 아파트 거래만) 대비 매매가 변동(만원)이다."""
     con = duckdb_client.get_connection()
     try:
-        year, month, day = duckdb_client.resolve_latest_date_partition(con, DATASET)
+        apt_only_where = "WHERE BLDG_USG = $bldg_usg"
+        apt_only_params = {"bldg_usg": "아파트"}
+        year, month, day = duckdb_client.resolve_latest_date_partition_for_filter(
+            con, DATASET, apt_only_where, apt_only_params
+        ) or duckdb_client.resolve_latest_date_partition(con, DATASET)
         history_glob = f"{duckdb_client.raw_base_path(DATASET)}/**/*.parquet"
 
         query = f"""

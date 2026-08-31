@@ -1,8 +1,10 @@
+import logging
 from collections import OrderedDict
 from datetime import date, timedelta
 from typing import Any
 
 from app.core import duckdb_client
+from app.core.config import settings
 
 # apt_mkt_trends 마트 실제 컬럼(DESCRIBE로 확인):
 # cgg_cd, cgg_nm, stdg_cd, stdg_nm, apt_name, mno, sno, deal_date, floor,
@@ -16,27 +18,32 @@ MART_TABLE = "apt_mkt_trends"
 PERIOD_DAYS = 90
 BIWEEKLY_BUCKET_COUNT = 6
 PYEONG_DIVISOR = 3.305785
-MIN_TRADE_COUNT = 3
+
+logger = logging.getLogger(__name__)
 
 
 def _period_range(today: date) -> tuple[date, date]:
-    """오늘을 기준으로 (today - 90일) ~ 오늘 구간의 시작일/종료일을 반환한다."""
+    """today(anchor)를 기준으로 (anchor - 90일) ~ anchor 구간의 시작일/종료일을 반환한다. 처음 호출 시
+    anchor는 실제 오늘 날짜이지만, 그 구간에 조건에 맞는 거래가 없으면 get_apt_trend_summary()가 이
+    anchor를 과거로 이동시킬 수 있다 — 즉 최종 응답의 search_period가 항상 "오늘 기준"이라고 가정하면
+    안 된다."""
     end_date = today
     start_date = today - timedelta(days=PERIOD_DAYS)
     return start_date, end_date
 
 
-def _build_where_clause(
+def _build_entity_conditions(
     cgg_cd: str | None,
     stdg_cd: str | None,
     mno: str | None,
     sno: str | None,
     apt_name: str | None,
-    start_date: date,
-    end_date: date,
-) -> tuple[str, dict[str, Any]]:
-    conditions = ["deal_date BETWEEN $start_date AND $end_date"]
-    params: dict[str, Any] = {"start_date": start_date, "end_date": end_date}
+) -> tuple[list[str], dict[str, Any]]:
+    """날짜 조건을 제외한, 단지 필터(cgg_cd/stdg_cd/mno/sno/apt_name) 조건 목록과 파라미터.
+    range-앵커 폴백(resolve_recent_match_date)은 날짜 범위 없이 이 조건만으로 이력 전체를
+    조회해야 하므로, 날짜 조건이 항상 포함되는 _build_where_clause와 분리했다."""
+    conditions: list[str] = []
+    params: dict[str, Any] = {}
     if cgg_cd:
         conditions.append("cgg_cd = $cgg_cd")
         params["cgg_cd"] = cgg_cd
@@ -53,6 +60,21 @@ def _build_where_clause(
         # apt_mkt_trends의 실제 apt_name 컬럼을 대소문자 무시 부분일치로 필터링한다.
         conditions.append("apt_name ILIKE $apt_name")
         params["apt_name"] = f"%{apt_name.strip()}%"
+    return conditions, params
+
+
+def _build_where_clause(
+    cgg_cd: str | None,
+    stdg_cd: str | None,
+    mno: str | None,
+    sno: str | None,
+    apt_name: str | None,
+    start_date: date,
+    end_date: date,
+) -> tuple[str, dict[str, Any]]:
+    entity_conditions, entity_params = _build_entity_conditions(cgg_cd, stdg_cd, mno, sno, apt_name)
+    conditions = ["deal_date BETWEEN $start_date AND $end_date", *entity_conditions]
+    params: dict[str, Any] = {"start_date": start_date, "end_date": end_date, **entity_params}
     return "WHERE " + " AND ".join(conditions), params
 
 
@@ -129,9 +151,10 @@ def _build_biweekly_trend(
 
 def _build_count_change_rate(biweekly_trend: list[dict[str, Any]]) -> int | None:
     """인접한 2주 구간 간 deal_count 증감률을 순서대로 계산해, 오래된 스텝부터 1,2,3,...로 선형 증가하는
-    가중치(최신 스텝일수록 가중치가 높음)로 가중평균한다. 스텝 양쪽 구간 중 하나라도 deal_count가
-    MIN_TRADE_COUNT 미만이면 해당 스텝은 가중치 0으로 제외한다. 유효 스텝(가중치 > 0)이 하나도 없으면
-    None을 반환한다."""
+    가중치(최신 스텝일수록 가중치가 높음)로 가중평균한다. 이전 구간의 deal_count가 0이면 증감률(%) 자체를
+    정의할 수 없으므로(0으로 나누기) 그 스텝만 제외한다 — 거래건수가 적다는 이유로 제외하지는 않는다
+    (rtt_service._build_volume_change_rate와 동일한 원칙). 계산 가능한 스텝이 하나도 없으면
+    (=마지막 구간을 제외한 나머지 구간 전부 거래 0건) None을 반환한다."""
     step_count = len(biweekly_trend) - 1
     if step_count < 1:
         return None
@@ -141,9 +164,9 @@ def _build_count_change_rate(biweekly_trend: list[dict[str, Any]]) -> int | None
     for i in range(step_count):
         prev_count = biweekly_trend[i]["deal_count"]
         curr_count = biweekly_trend[i + 1]["deal_count"]
-        weight = 0 if (prev_count < MIN_TRADE_COUNT or curr_count < MIN_TRADE_COUNT) else i + 1
-        if weight == 0:
+        if prev_count == 0:  # 0으로 나누기 방지만 — 거래건수가 적다는 이유로 제외하지 않는다.
             continue
+        weight = i + 1  # 항상 스텝 가중치 적용
         step_rate = (curr_count - prev_count) / prev_count * 100
         weighted_sum += step_rate * weight
         weight_total += weight
@@ -259,18 +282,55 @@ def get_apt_trend_summary(
     sno: str | None,
     apt_name: str | None = None,
 ) -> dict[str, Any]:
-    """오늘 기준 최근 90일간, 지정된(선택적) 조건에 맞는 apt_mkt_trends 실거래 데이터를 단지
+    """기본적으로 오늘 기준 최근 90일간, 지정된(선택적) 조건에 맞는 apt_mkt_trends 실거래 데이터를 단지
     (cgg_cd+stdg_cd+apt_name) 단위로 집계하여 단일 JSON으로 반환한다. apt_name은 apt_mkt_trends의 실제
     컬럼이지만 전역 고유하지 않아(동명 단지가 여러 법정동에 존재) cgg_cd+stdg_cd와 함께 그룹 키로 사용한다.
-    apt_name이 주어지면 실제 apt_name 컬럼을 SQL WHERE(ILIKE)에서 부분일치 필터링한다
-    (다른 마트를 조인하지 않으며, 매칭되는 데이터가 없으면 빈 결과를 그대로 반환한다).
-    count_change_rate는 다른 기간과 비교하거나 구간을 반으로 쪼개지 않고, biweekly_trend(90일을 6구간으로
-    균등 분할한 거래량 전체)에 선형회귀로 추세선을 구해 시작 추정치 대비 끝 추정치 변화율(%)로 계산한다.
+    apt_name이 주어지면 실제 apt_name 컬럼을 SQL WHERE(ILIKE)에서 부분일치 필터링한다(다른 마트를
+    조인하지 않는다).
+
+    이 90일 창(오늘 기준)에 조건에 맞는 거래가 하나도 없으면, 날짜 범위 제한 없이 전체 이력에서 조건에
+    매칭되는 가장 최근 deal_date를 한 번에 찾아(`resolve_recent_match_date`) 그 날짜를 새 end_date로
+    삼아 90일 창 전체를 그 시점으로 이동시켜 재조회한다("파티션 폴백"이 아니라 "조회 창의 기준일(anchor)
+    이동"). 이동된 시작일이 원래 창의 시작일보다 settings.max_base_date_lookback일 이상 더 과거이거나,
+    애초에 그 조건의 거래가 이력 전체에 없으면 창을 이동하지 않고 기존처럼 빈 결과를 그대로 반환한다
+    (에러 아님). 창이 실제로 이동된 경우 search_period.start_date/end_date는 "오늘 기준 90일"이 아니라
+    이동된 실제 구간을 반영한다.
+
+    count_change_rate는 biweekly_trend(90일을 6구간으로 균등 분할한 거래량)의 인접 구간(스텝)별
+    증감률을, 오래된 스텝일수록 낮고 최신 스텝일수록 높은 가중치(1,2,3,...)로 가중평균해 계산한다.
+    이전 구간 거래건수가 0인 스텝만 계산에서 제외한다(자세한 내용은 _build_count_change_rate 참고).
     여러 단지가 매칭되면 총 거래건수(total_deal_count) 내림차순으로 정렬한다."""
     start_date, end_date = _period_range(date.today())
     con = duckdb_client.get_connection()
     try:
         rows = _fetch_rows(con, cgg_cd, stdg_cd, mno, sno, apt_name, start_date, end_date)
+
+        if not rows:
+            naive_start, naive_end = start_date, end_date
+            entity_conditions, entity_params = _build_entity_conditions(cgg_cd, stdg_cd, mno, sno, apt_name)
+            match_where = ("WHERE " + " AND ".join(entity_conditions)) if entity_conditions else ""
+            full_glob = f"{duckdb_client.mart_base_path(MART_TABLE)}/**/*.parquet"
+            matched_date = duckdb_client.resolve_recent_match_date(
+                con, full_glob, "deal_date", match_where, entity_params
+            )
+            if matched_date is not None and matched_date >= start_date - timedelta(
+                days=settings.max_base_date_lookback
+            ):
+                end_date = matched_date
+                start_date = end_date - timedelta(days=PERIOD_DAYS)
+                rows = _fetch_rows(con, cgg_cd, stdg_cd, mno, sno, apt_name, start_date, end_date)
+                logger.info(
+                    "Anchor fallback used for table=%s, condition_summary=%s, "
+                    "naive_window=%s~%s, matched_window=%s~%s",
+                    MART_TABLE,
+                    (match_where or "(no filter)")[:100],
+                    naive_start,
+                    naive_end,
+                    start_date,
+                    end_date,
+                )
+            # matched_date가 없거나 lookback 상한을 넘으면 rows/기간은 나이브 값 그대로 —
+            # 기존과 동일하게 빈 결과 반환(에러 아님).
     finally:
         con.close()
 
