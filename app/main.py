@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from app.api.routes import health
 from app.api.v1.router import router as api_v1_router
@@ -64,10 +64,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
 app.include_router(health.router)
 app.include_router(api_v1_router)
+
+
+@app.get("/static/{file_path:path}", include_in_schema=False)
+def static_file(file_path: str):
+    """정적 자산(Swagger UI/ReDoc용)을 직접 서빙한다. Starlette의 app.mount(StaticFiles)를
+    쓰지 않는다 - 이 서버는 uvicorn --root-path /fastapi-direct로 뜨는데, root_path가 설정된
+    상태에서는 Mount 서브라우팅의 경로 계산이 어긋나 실제 파일이 있어도 404가 나는 문제를
+    실측으로 확인했다(일반 @app.get 라우트는 root_path와 무관하게 정상 동작함). 그래서 일반
+    라우트 하나로 직접 파일을 읽어 반환한다."""
+    target = (STATIC_DIR / file_path).resolve()
+    if STATIC_DIR.resolve() not in target.parents or not target.is_file():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(target)
 
 
 @app.get("/docs", include_in_schema=False)

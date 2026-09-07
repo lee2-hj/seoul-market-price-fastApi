@@ -83,19 +83,52 @@ def _build_totals(rows: list[dict[str, Any]]) -> tuple[int, int, int, int]:
     return total_deal_cnt, round(total_trade_amount), avg_trade_amount, max_trade_amount
 
 
+def _build_avg_pyeong_amount(rows: list[dict[str, Any]], total_deal_cnt: int) -> int:
+    """평균 평단가(만원/평) = 각 row의 평단가(trade_amount / pyeong) 합계를 total_deal_cnt로
+    나눠 반올림한다(다른 dm_ 마트들의 avg_pyeong_amt/avg_pyeong_price와 동일한 계산 관례 -
+    "전체 매매가 합계 / 전체 평 합계"가 아니라 "건별 평단가의 평균"이다)."""
+    if not total_deal_cnt:
+        return 0
+    total_pyeong_amount = sum(r["trade_amount"] / r["pyeong"] for r in rows if r["pyeong"])
+    return round(total_pyeong_amount / total_deal_cnt)
+
+
 def _build_volume_change_rate(
-    rows: list[dict[str, Any]], start_date: date, end_date: date
+    biweekly_trend: list[dict[str, Any]], data_end: date | None
 ) -> float | None:
-    """90일 구간을 이전 45일/최근 45일로 절반씩 나눠 거래량 증감률(%)을 계산한다."""
-    prior_half_end = (start_date + timedelta(days=HALF_PERIOD_DAYS - 1)).isoformat()
-    recent_half_start = (start_date + timedelta(days=HALF_PERIOD_DAYS)).isoformat()
+    """biweekly_trend(응답에 그대로 노출되는 6구간 거래량 추이, "그래프"와 동일한 데이터)의
+    첫 3구간(이전 45일) 평균 거래량 대비 마지막 3구간(최근 45일) 평균 거래량 증감률(%)을
+    계산한다 - 그래프에 보이는 것과 항상 같은 숫자에서 파생되도록, 별도로 원본 rows를 다시
+    필터링하지 않고 이미 계산된 biweekly_trend를 그대로 사용한다.
 
-    prior_cnt = sum(r["trade_count"] for r in rows if r["deal_date"] <= prior_half_end)
-    recent_cnt = sum(r["trade_count"] for r in rows if r["deal_date"] >= recent_half_start)
+    RTT 마트는 지역에 따라 적재가 며칠~몇 주씩 지연될 수 있다(실측 확인: sgg_cd=11680은
+    "오늘" 기준 실제 마지막 거래일이 여러 날~한 달 가까이 이전). 이 때문에 마지막 구간(들)의
+    종료일이 실제 데이터가 존재하는 마지막 날짜(data_end)보다 미래이면, 그 구간은 아직 실거래
+    신고/적재가 다 끝나지 않은 "불완전한" 구간이다. 이런 구간을 그대로 포함해 평균에 반영하면
+    (그래프에서도 눈에 띄게 낮게 찍히는) 미완성 구간 때문에 감소폭이 실제보다 과장된다 -
+    부분적으로 비중을 줄여 반영하는 대신, 완전히 채워지지 않은 구간은 비교에서 통째로
+    제외한다(그래프를 보는 사람이 "이 구간은 아직 안 찼다"고 눈으로 판단할 만한 수준이면
+    통계에서도 빼는 것이 더 정확하다).
 
-    if prior_cnt == 0:
+    이전 3구간(항상 완결된 과거) 또는 완전한 최근 구간이 하나도 남지 않으면 None을 반환한다.
+    data_end를 알 수 없으면(rows 자체가 없음) 모든 구간을 완전한 것으로 취급한다(기존 동작과
+    동일 - 이 경우 마트 적재 지연 여부를 판단할 수 없기 때문)."""
+    half = BIWEEKLY_BUCKET_COUNT // 2
+    prior_buckets = biweekly_trend[:half]
+    recent_buckets = biweekly_trend[half:]
+
+    if data_end is not None:
+        recent_buckets = [b for b in recent_buckets if b["end_date"] <= data_end]
+
+    if not prior_buckets or not recent_buckets:
         return None
-    return round((recent_cnt - prior_cnt) / prior_cnt * 100, 2)
+
+    prior_avg = sum(b["deal_cnt"] for b in prior_buckets) / len(prior_buckets)
+    if prior_avg == 0:
+        return None
+
+    recent_avg = sum(b["deal_cnt"] for b in recent_buckets) / len(recent_buckets)
+    return round((recent_avg - prior_avg) / prior_avg * 100, 2)
 
 
 def _generate_biweekly_buckets(start_date: date, end_date: date) -> list[tuple[date, date]]:
@@ -363,9 +396,12 @@ def get_rtt_summary(*, sgg_cd: str, dong_cd: str | None = None) -> dict[str, Any
         con.close()
 
     buckets = _generate_biweekly_buckets(start_date, end_date)
+    biweekly_trend = _build_biweekly_trend(rows, buckets)
     total_deal_cnt, total_trade_amount, avg_trade_amount, max_trade_amount = _build_totals(rows)
+    avg_pyeong_amount = _build_avg_pyeong_amount(rows, total_deal_cnt)
     sgg_nm = rows[0]["sgg_nm"] if rows else None
     dong_nm = rows[0]["dong_nm"] if (dong_cd and rows) else None
+    data_end = max((date.fromisoformat(r["deal_date"]) for r in rows), default=None)
 
     return {
         "sgg_cd": sgg_cd,
@@ -377,9 +413,10 @@ def get_rtt_summary(*, sgg_cd: str, dong_cd: str | None = None) -> dict[str, Any
         "total_deal_cnt": total_deal_cnt,
         "total_trade_amount": total_trade_amount,
         "avg_trade_amount": avg_trade_amount,
+        "avg_pyeong_amount": avg_pyeong_amount,
         "max_trade_amount": max_trade_amount,
-        "volume_change_rate": _build_volume_change_rate(rows, start_date, end_date),
-        "biweekly_trend": _build_biweekly_trend(rows, buckets),
+        "volume_change_rate": _build_volume_change_rate(biweekly_trend, data_end),
+        "biweekly_trend": biweekly_trend,
         "pyeong_distribution": _build_pyeong_distribution(rows, total_deal_cnt),
         "recent_trades": _build_recent_trades(rows, include_location=not dong_cd),
         "top5_by_volume": _build_top5_by_volume(rows),

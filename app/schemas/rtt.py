@@ -98,6 +98,13 @@ class RttSummaryResponse(BaseModel):
     total_deal_cnt: int = Field(..., description="기간 내 일자들의 거래건수 총합")
     total_trade_amount: int = Field(..., description="기간 내 거래건수 총 거래금액")
     avg_trade_amount: int = Field(..., description="평균 거래가(총 거래금액 / 총 거래건수, 반올림)")
+    avg_pyeong_amount: int = Field(
+        ...,
+        description=(
+            "평균 평단가(만원/평). 각 거래건의 평단가(trade_amount / pyeong) 합계를 "
+            "총 거래건수로 나눠 반올림한 값."
+        ),
+    )
     max_trade_amount: int = Field(..., description="기간 내 일자들 중 최고 거래가")
     volume_change_rate: float | None = Field(
         default=None,
