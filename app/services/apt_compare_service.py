@@ -1,10 +1,19 @@
 import logging
+import time
 from datetime import date, timedelta
 from typing import Any
 
 from app.core import duckdb_client
 from app.core.cache import cached_call
 from app.core.config import settings
+
+# fetch_recent_supply_pyeong()은 MinIO/GCS 스토리지에 의존하는데, 실측으로 일시적인 IO 에러
+# (예: "Could not connect to server error for HTTP GET to ...")가 관측되었다. 이 함수는 부가
+# 정보(query_type='floor' 조회 시 recent_supply_pyeong 보완)만 조회하므로, 일시적 오류만
+# 재시도로 흡수한다(모든 시도가 실패하면 호출부가 감지해 None으로 대체할 수 있도록 마지막
+# 예외를 그대로 올린다).
+GOLD_QUERY_RETRY_ATTEMPTS = 3
+GOLD_QUERY_RETRY_DELAY_SECONDS = 0.5
 
 MART_TABLE_BY_QUERY_TYPE: dict[str, str] = {
     "pyeong": "dm_apt_pyeong_price",
@@ -211,6 +220,46 @@ def _fetch_silver_group_row(
     return result
 
 
+def _fetch_gold_items_with_retry(
+    mart_table: str, where_clause: str, params: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], Any]:
+    """골드 마트에서 base_date 소급 탐색 + 실제 row 조회까지 전체를 스토리지 일시적 IO 오류에
+    대비해 최대 GOLD_QUERY_RETRY_ATTEMPTS회까지 재시도한다(매 시도마다 새 커넥션 사용 - 실패한
+    커넥션이 불완전한 상태로 남아있을 수 있어서). 성공하면 (base_date, items, con)을 반환하며,
+    반환된 con은 호출자가 이어서 실버 폴백 조회에 재사용한 뒤 반드시 닫아야 한다."""
+    last_exc: Exception | None = None
+    for attempt in range(GOLD_QUERY_RETRY_ATTEMPTS):
+        con = duckdb_client.get_connection()
+        try:
+            base_date = duckdb_client.resolve_base_date_for_filter(
+                con, mart_table, where_clause, params
+            ) or duckdb_client.resolve_base_date(con, mart_table)
+            parquet_glob = f"{duckdb_client.mart_base_path(mart_table)}/base_date={base_date}/*.parquet"
+
+            query = f"""
+                SELECT *
+                FROM read_parquet('{parquet_glob}', hive_partitioning = true)
+                {where_clause}
+            """
+            result = con.execute(query, params)
+            items = duckdb_client.rows_to_dicts(result)
+            return base_date, items, con
+        except Exception as exc:  # noqa: BLE001 - 스토리지 IO 예외는 duckdb.Error 계열로 다양함
+            last_exc = exc
+            con.close()
+            if attempt < GOLD_QUERY_RETRY_ATTEMPTS - 1:
+                logger.warning(
+                    "compare_apartments gold fetch failed (attempt %d/%d), retrying: %s",
+                    attempt + 1,
+                    GOLD_QUERY_RETRY_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(GOLD_QUERY_RETRY_DELAY_SECONDS)
+
+    assert last_exc is not None
+    raise last_exc
+
+
 def compare_apartments(
     *, cgg_cd: str, stdg_cd: str, bldg_nm: str | None, mno: str, sno: str, query_type: str, grp: str | None
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -231,24 +280,11 @@ def compare_apartments(
         # 마트의 pyeong_grp 컬럼은 최상위 구간을 "40+"로 저장하므로, 입력값 "40"을 "40+"로 변환해 조회한다.
         resolved_grp = "40+"
 
-    con = duckdb_client.get_connection()
+    where_clause, params = _build_where_clause(
+        cgg_cd, stdg_cd, mno, sno, bldg_nm, grp_column, resolved_grp
+    )
+    base_date, items, con = _fetch_gold_items_with_retry(mart_table, where_clause, params)
     try:
-        where_clause, params = _build_where_clause(
-            cgg_cd, stdg_cd, mno, sno, bldg_nm, grp_column, resolved_grp
-        )
-        base_date = duckdb_client.resolve_base_date_for_filter(
-            con, mart_table, where_clause, params
-        ) or duckdb_client.resolve_base_date(con, mart_table)
-        parquet_glob = f"{duckdb_client.mart_base_path(mart_table)}/base_date={base_date}/*.parquet"
-
-        query = f"""
-            SELECT *
-            FROM read_parquet('{parquet_glob}', hive_partitioning = true)
-            {where_clause}
-        """
-        result = con.execute(query, params)
-        items = duckdb_client.rows_to_dicts(result)
-
         if not items and resolved_grp:
             cache_key = (cgg_cd, stdg_cd, bldg_nm, mno, sno, query_type, resolved_grp)
             silver_item = cached_call(
@@ -283,24 +319,46 @@ def fetch_recent_supply_pyeong(
 ) -> float | None:
     """dm_apt_pyeong_price 마트에는 있지만 dm_apt_flr_price 마트에는 없는 recent_supply_pyeong을 보완하기 위해,
     자치구코드+법정동코드+지번 본번(mno)+지번 부번(sno)(+건물명, 선택)이 일치하는 row 중 recent_deal_date가 가장
-    최근인 row의 recent_supply_pyeong 값을 조회한다. query_type='floor' 조회 시 사용."""
-    mart_table = MART_TABLE_BY_QUERY_TYPE["pyeong"]
-    con = duckdb_client.get_connection()
-    try:
-        where_clause, params = _build_where_clause(cgg_cd, stdg_cd, mno, sno, bldg_nm, None, None)
-        base_date = duckdb_client.resolve_base_date_for_filter(
-            con, mart_table, where_clause, params
-        ) or duckdb_client.resolve_base_date(con, mart_table)
-        parquet_glob = f"{duckdb_client.mart_base_path(mart_table)}/base_date={base_date}/*.parquet"
+    최근인 row의 recent_supply_pyeong 값을 조회한다. query_type='floor' 조회 시 사용.
 
-        query = f"""
-            SELECT recent_supply_pyeong
-            FROM read_parquet('{parquet_glob}', hive_partitioning = true)
-            {where_clause}
-            ORDER BY recent_deal_date DESC
-            LIMIT 1
-        """
-        row = con.execute(query, params).fetchone()
-    finally:
-        con.close()
-    return row[0] if row else None
+    스토리지(MinIO/GCS) 일시적 IO 오류를 흡수하기 위해 base_date 탐색부터 실제 조회까지
+    전체를 최대 GOLD_QUERY_RETRY_ATTEMPTS회까지 재시도한다(매 시도마다 새 커넥션을 사용한다 -
+    실패한 커넥션이 불완전한 상태로 남아있을 수 있어서). 모든 시도가 실패하면 마지막 예외를
+    그대로 올린다 - 이 함수는 부가 정보(recent_supply_pyeong)만 제공하므로, 호출부(엔드포인트)가
+    이 예외를 잡아 None으로 대체해 전체 응답이 실패하지 않도록 처리한다."""
+    mart_table = MART_TABLE_BY_QUERY_TYPE["pyeong"]
+    where_clause, params = _build_where_clause(cgg_cd, stdg_cd, mno, sno, bldg_nm, None, None)
+
+    last_exc: Exception | None = None
+    for attempt in range(GOLD_QUERY_RETRY_ATTEMPTS):
+        con = duckdb_client.get_connection()
+        try:
+            base_date = duckdb_client.resolve_base_date_for_filter(
+                con, mart_table, where_clause, params
+            ) or duckdb_client.resolve_base_date(con, mart_table)
+            parquet_glob = f"{duckdb_client.mart_base_path(mart_table)}/base_date={base_date}/*.parquet"
+
+            query = f"""
+                SELECT recent_supply_pyeong
+                FROM read_parquet('{parquet_glob}', hive_partitioning = true)
+                {where_clause}
+                ORDER BY recent_deal_date DESC
+                LIMIT 1
+            """
+            row = con.execute(query, params).fetchone()
+            return row[0] if row else None
+        except Exception as exc:  # noqa: BLE001 - 스토리지 IO 예외는 duckdb.Error 계열로 다양함
+            last_exc = exc
+            if attempt < GOLD_QUERY_RETRY_ATTEMPTS - 1:
+                logger.warning(
+                    "fetch_recent_supply_pyeong failed (attempt %d/%d), retrying: %s",
+                    attempt + 1,
+                    GOLD_QUERY_RETRY_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(GOLD_QUERY_RETRY_DELAY_SECONDS)
+        finally:
+            con.close()
+
+    assert last_exc is not None
+    raise last_exc

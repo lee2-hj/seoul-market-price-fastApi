@@ -89,6 +89,37 @@ def test_compare_apartments_still_converts_pyeong_grp_40_to_40_plus(monkeypatch)
     assert captured["params"]["grp"] == "40+"
 
 
+def test_compare_apartments_retries_transient_storage_error_on_gold_fetch(monkeypatch):
+    """골드 마트 조회(base_date 탐색+실제 read) 중 스토리지 일시적 IO 오류가 나면, 성공할
+    때까지(최대 GOLD_QUERY_RETRY_ATTEMPTS회) 매번 새 커넥션으로 재시도해야 한다."""
+    monkeypatch.setattr(svc.duckdb_client, "resolve_base_date_for_filter", lambda *a, **k: "2026-08-27")
+    monkeypatch.setattr(svc.duckdb_client, "rows_to_dicts", lambda result: [{"cgg_cd": "11500"}])
+    monkeypatch.setattr(svc.time, "sleep", lambda *_: None)
+
+    attempts = {"n": 0}
+
+    class _FlakyCon:
+        def execute(self, query, params=None):
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                raise IOError("Could not connect to server error for HTTP GET")
+            return object()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(svc.duckdb_client, "get_connection", lambda: _FlakyCon())
+
+    base_date, items = svc.compare_apartments(
+        cgg_cd="11500", stdg_cd="10300", bldg_nm=None, mno="1", sno="0",
+        query_type="pyeong", grp="30",
+    )
+
+    assert base_date == "2026-08-27"
+    assert items == [{"cgg_cd": "11500"}]
+    assert attempts["n"] == 2
+
+
 def test_fetch_recent_supply_pyeong_uses_fallback_base_date(monkeypatch):
     captured: dict = {}
 
@@ -118,6 +149,63 @@ def test_fetch_recent_supply_pyeong_uses_fallback_base_date(monkeypatch):
 
     assert result == 12.3
     assert captured["mart_table"] == svc.MART_TABLE_BY_QUERY_TYPE["pyeong"]
+
+
+# ---------------------------------------------------------------------------
+# fetch_recent_supply_pyeong: 스토리지 일시적 IO 오류 재시도 회귀 테스트
+# (실제 사례: cgg_cd=11680/stdg_cd=10300/bldg_nm=개포2차현대아파트(220) 조회 시
+# resolve_base_date_for_filter 내부에서 MinIO 연결 오류로 500이 발생했음)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_recent_supply_pyeong_retries_transient_storage_error(monkeypatch):
+    """처음 두 번은 일시적 IO 오류가 나고 세 번째 시도에서 성공하면, 그 값을 그대로 반환해야
+    한다(매 시도마다 새 커넥션을 사용)."""
+    monkeypatch.setattr(svc.duckdb_client, "resolve_base_date_for_filter", lambda *a, **k: "2026-08-27")
+    monkeypatch.setattr(svc.time, "sleep", lambda *_: None)
+
+    attempts = {"n": 0}
+
+    class _FlakyCon:
+        def execute(self, query, params=None):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise IOError("Could not connect to server error for HTTP GET")
+
+            class _R:
+                def fetchone(self):
+                    return (15.5,)
+
+            return _R()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(svc.duckdb_client, "get_connection", lambda: _FlakyCon())
+
+    result = svc.fetch_recent_supply_pyeong(cgg_cd="11680", stdg_cd="10300", bldg_nm=None, mno="1", sno="0")
+
+    assert result == 15.5
+    assert attempts["n"] == 3
+
+
+def test_fetch_recent_supply_pyeong_raises_after_exhausting_retries(monkeypatch):
+    """모든 재시도가 실패하면 마지막 예외를 그대로 올린다 - 호출부(엔드포인트)가 이를 잡아
+    None으로 대체하는 건 엔드포인트의 책임이다."""
+    monkeypatch.setattr(svc.duckdb_client, "resolve_base_date_for_filter", lambda *a, **k: "2026-08-27")
+    monkeypatch.setattr(svc.time, "sleep", lambda *_: None)
+
+    class _AlwaysFailCon:
+        def execute(self, query, params=None):
+            raise IOError("Could not connect to server error for HTTP GET")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(svc.duckdb_client, "get_connection", lambda: _AlwaysFailCon())
+
+    with pytest.raises(IOError):
+        svc.fetch_recent_supply_pyeong(cgg_cd="11680", stdg_cd="10300", bldg_nm=None, mno="1", sno="0")
 
 
 # ---------------------------------------------------------------------------

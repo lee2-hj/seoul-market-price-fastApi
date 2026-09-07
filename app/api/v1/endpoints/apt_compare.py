@@ -1,4 +1,5 @@
 # 아파트 평단가/층별가 자치구+법정동 비교 조회 api
+import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -7,6 +8,8 @@ from app.schemas.apt_compare import AptCompareGroup, AptCompareQuery, AptCompare
 from app.services import apt_compare_service
 
 router = APIRouter(prefix="/apt-price/apt-compare", tags=["apt-compare"])
+
+logger = logging.getLogger(__name__)
 
 
 def _build_group(item: dict[str, Any] | None, fallback_supply_pyeong: float | None = None) -> AptCompareGroup | None:
@@ -82,13 +85,24 @@ def get_apt_compare(
 
     fallback_supply_pyeong = None
     if query.query_type == "floor":
-        fallback_supply_pyeong = apt_compare_service.fetch_recent_supply_pyeong(
-            cgg_cd=query.cgg_cd,
-            stdg_cd=query.stdg_cd,
-            bldg_nm=query.bldg_nm,
-            mno=query.mno,
-            sno=query.sno,
-        )
+        try:
+            fallback_supply_pyeong = apt_compare_service.fetch_recent_supply_pyeong(
+                cgg_cd=query.cgg_cd,
+                stdg_cd=query.stdg_cd,
+                bldg_nm=query.bldg_nm,
+                mno=query.mno,
+                sno=query.sno,
+            )
+        except Exception:
+            # recent_supply_pyeong은 dm_apt_pyeong_price에서 보완하는 부가 정보일 뿐이다
+            # (스키마상으로도 Optional). 이미 위에서 grp/grp2 조회는 성공했는데, 이 보완
+            # 조회 하나(예: 스토리지 일시적 IO 오류)가 실패했다고 응답 전체를 500으로
+            # 날리지 않고, 그 필드만 None으로 비워서 나머지는 정상 반환한다.
+            logger.warning(
+                "fetch_recent_supply_pyeong failed, falling back to None",
+                exc_info=True,
+            )
+            fallback_supply_pyeong = None
 
     return AptCompareResponse(
         base_date=base_date,
