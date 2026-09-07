@@ -2,6 +2,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from app.core import duckdb_client
+from app.services import apt_recent_rank_service
 
 # dm_main 마트 스키마: base_date, cgg_cd, cgg_nm, stdg_cd, stdg_nm, bldg_nm, deal_date(실제 거래일),
 # area, mno, sno, latitude, longitude, deal_cnt(거래건수), total_thing_amt(매매가 합계),
@@ -156,11 +157,12 @@ def _build_top_trading_dongs(con, latest_base_date: str, cgg_cd: str) -> list[di
     query = f"""
         SELECT
             any_value(cgg_nm) AS cgg_nm,
+            stdg_cd,
             stdg_nm,
             SUM(deal_cnt) AS deal_cnt
         FROM read_parquet('{_partition_glob(latest_base_date)}', hive_partitioning = true)
         WHERE cgg_cd = $cgg_cd
-        GROUP BY stdg_nm
+        GROUP BY stdg_cd, stdg_nm
         HAVING SUM(deal_cnt) > 0
         ORDER BY deal_cnt DESC
         LIMIT {TOP5_LIMIT}
@@ -203,7 +205,13 @@ def get_dashboard(*, cgg_cd: str | None) -> dict[str, Any]:
     쓰고, resolved_cgg_cd로 필터링하는 3개(preference_price_trend/preference_top_trading_dongs/
     preference_top_trading_apts)만 그 지역 조건 기준으로 별도 폴백한 preference_base_date를
     사용한다 — 최신 파티션엔 그 지역 데이터가 없어도 과거 파티션엔 있을 수 있기 때문이다(compare
-    계열 비교형 API와 동일한 "위젯 그룹별로 다른 base_date를 가질 수 있다"는 원리)."""
+    계열 비교형 API와 동일한 "위젯 그룹별로 다른 base_date를 가질 수 있다"는 원리).
+
+    추가로 apt_recent_rank_service.get_apt_recent_rank()를 별도 엔드포인트로 노출하지 않고 그대로
+    호출해, resolved_cgg_cd(=sgg_cd)와 preference_popular_dong.stdg_cd(=dong_cd, 이 대시보드에서
+    방금 계산한 가장 인기있는 법정동)를 이용한 법정동 내 최근 90일 개별 실거래 Top5/Bottom5 전체
+    응답을 apt_recent_rank 키에 그대로 담아 함께 반환한다. 인기 법정동 자체가 없으면(선호지역에
+    거래 데이터가 없음) apt_recent_rank는 null이다."""
     resolved_cgg_cd = cgg_cd.strip() if cgg_cd and cgg_cd.strip() else DEFAULT_CGG_CD
     today = date.today()
     start_date, end_date = _period_range(today)
@@ -228,9 +236,23 @@ def get_dashboard(*, cgg_cd: str | None) -> dict[str, Any]:
     preference_popular_dong = (
         {
             "cgg_nm": preference_top_trading_dongs[0]["cgg_nm"],
+            "stdg_cd": preference_top_trading_dongs[0]["stdg_cd"],
             "stdg_nm": preference_top_trading_dongs[0]["stdg_nm"],
         }
         if preference_top_trading_dongs
+        else None
+    )
+
+    # apt-recent-rank(법정동 내 최근 90일 개별 실거래 Top5/Bottom5)를 별도 엔드포인트로 노출하지
+    # 않고, 대시보드의 파라미터(resolved_cgg_cd)와 방금 계산한 "가장 인기있는 법정동"
+    # (preference_popular_dong.stdg_cd)을 그대로 이용해 조회한 뒤 전체 리턴값을 그대로 함께
+    # 내려준다. 인기 법정동 자체가 없으면(=선호지역에 거래 데이터가 없음) 조회할 법정동이 없으므로
+    # None을 반환한다.
+    apt_recent_rank = (
+        apt_recent_rank_service.get_apt_recent_rank(
+            sgg_cd=resolved_cgg_cd, dong_cd=preference_popular_dong["stdg_cd"]
+        )
+        if preference_popular_dong
         else None
     )
 
@@ -245,4 +267,5 @@ def get_dashboard(*, cgg_cd: str | None) -> dict[str, Any]:
         "preference_top_trading_dongs": preference_top_trading_dongs,
         "preference_popular_dong": preference_popular_dong,
         "preference_top_trading_apts": preference_top_trading_apts,
+        "apt_recent_rank": apt_recent_rank,
     }

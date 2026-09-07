@@ -7,6 +7,7 @@ from app.api.v1.endpoints import (
     compare,
     dashboard,
     dong_summary,
+    main_mart,
     real_estate,
     region_apt_compare,
     rtt,
@@ -22,3 +23,4 @@ router.include_router(apt_trend.router)
 router.include_router(region_apt_compare.router)
 router.include_router(dashboard.router)
 router.include_router(real_estate.router)
+router.include_router(main_mart.router)

@@ -30,5 +30,12 @@ class Settings(BaseSettings):
     raw: str = "lake"
     lake: str = "warehouse"
 
+    # 실버(Iceberg fact) 레이어 - 골드 마트(예: dm_apt_recent_trade)에 매칭되는 단지가 없을 때
+    # (최근 90일 거래 0건) 온디맨드로 Fallback 집계할 원본 거래 테이블명과, 그 결과를 캐싱할
+    # 인메모리 TTL 캐시 설정. lake(warehouse) 버킷 루트에 위치한다(mart/ 프리픽스 없음).
+    silver_apt_transactions_table: str = "fact_apt_transactions"
+    silver_fallback_cache_ttl_seconds: int = 3600
+    silver_fallback_cache_maxsize: int = 2048
+
 
 settings = Settings()

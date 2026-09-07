@@ -83,10 +83,12 @@ class AptTrendData(BaseModel):
     count_change_rate: int | None = Field(
         default=None,
         description=(
-            "biweekly_trend의 인접한 구간 간 deal_count 증감률(%)을, 오래된 스텝부터 1,2,3,...로 "
-            "선형 증가하는 가중치(최신 스텝일수록 가중치가 높음)로 가중평균해 반올림한 정수값이다. "
-            "이전 구간의 거래건수가 0이면(증감률 계산 불가) 해당 스텝만 제외되며, 계산 가능한 스텝이 "
-            "하나도 없으면(마지막 구간을 제외한 나머지 구간 전부 거래 0건) null을 반환한다."
+            "biweekly_trend에서 거래가 있는(deal_count > 0) 구간끼리만 순서대로 짝지어 계산한 "
+            "deal_count 증감률(%)을, 각 스텝 뒤쪽 구간의 원래 위치(0-based index, 최신일수록 큰 "
+            "값)로 가중평균해 반올림한 정수값이다. 거래가 아예 없는(0건) 구간은 짝짓기에서 완전히 "
+            "제외되므로(중간에 낀 0건 구간이 인접 구간과 그대로 비교되어 -100%에 가깝게 왜곡되는 "
+            "것을 방지), 실제로는 인접하지 않은 두 구간이 비교될 수 있다. 거래가 있는 구간이 2개 "
+            "미만이면(비교할 스텝 자체가 없음) null을 반환한다."
         ),
     )
     biweekly_trend: list[BiweeklyTrendItem] = Field(

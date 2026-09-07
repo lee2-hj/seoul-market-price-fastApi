@@ -85,6 +85,81 @@ def test_get_dashboard_preference_base_date_falls_back_to_naive_latest_when_no_m
     assert result["preference_base_date"] == "2026-08-30"
 
 
+def test_get_dashboard_embeds_apt_recent_rank_using_popular_dong(monkeypatch):
+    """preference_popular_dong(선호지역 내 거래량 1위 법정동)이 있으면, 그 stdg_cd와
+    resolved_cgg_cd를 그대로 apt_recent_rank_service.get_apt_recent_rank()에 넘겨 조회하고,
+    그 전체 응답을 apt_recent_rank 키에 그대로 담아야 한다(별도 엔드포인트로 분리하지 않음)."""
+    monkeypatch.setattr(dashboard_service.duckdb_client, "get_connection", lambda: MagicMock())
+    monkeypatch.setattr(dashboard_service.duckdb_client, "resolve_base_date", lambda *a, **k: "2026-08-30")
+    monkeypatch.setattr(
+        dashboard_service.duckdb_client, "resolve_base_date_for_filter", lambda *a, **k: "2026-08-30"
+    )
+    monkeypatch.setattr(dashboard_service, "_build_seoul_top5_districts", lambda *a, **k: [])
+    monkeypatch.setattr(
+        dashboard_service, "_build_price_change_top5", lambda *a, **k: {"rising_top5": [], "falling_top5": []}
+    )
+    monkeypatch.setattr(dashboard_service, "_build_preference_price_trend", lambda *a, **k: [])
+    monkeypatch.setattr(
+        dashboard_service,
+        "_build_top_trading_dongs",
+        lambda *a, **k: [{"cgg_nm": "강남구", "stdg_cd": "10300", "stdg_nm": "개포동", "deal_cnt": 50}],
+    )
+    monkeypatch.setattr(dashboard_service, "_build_top_trading_apts", lambda *a, **k: [])
+
+    captured: dict = {}
+
+    def fake_get_apt_recent_rank(*, sgg_cd, dong_cd):
+        captured["sgg_cd"] = sgg_cd
+        captured["dong_cd"] = dong_cd
+        return {
+            "sgg_cd": sgg_cd, "sgg_nm": "강남구", "dong_cd": dong_cd, "dong_nm": "개포동",
+            "period_start": "2026-06-10", "period_end": "2026-09-07",
+            "top": [{"apt_name": "테스트단지", "exclusive_area_m2": 84.6, "pyeong": 25.6,
+                     "floor": 5, "trade_amount": 150000.0}],
+            "bottom": [],
+        }
+
+    monkeypatch.setattr(
+        dashboard_service.apt_recent_rank_service, "get_apt_recent_rank", fake_get_apt_recent_rank
+    )
+
+    result = dashboard_service.get_dashboard(cgg_cd="11680")
+
+    assert captured == {"sgg_cd": "11680", "dong_cd": "10300"}
+    assert result["apt_recent_rank"]["dong_cd"] == "10300"
+    assert result["apt_recent_rank"]["top"][0]["apt_name"] == "테스트단지"
+
+
+def test_get_dashboard_apt_recent_rank_is_none_when_no_popular_dong(monkeypatch):
+    """preference_popular_dong이 없으면(선호지역 거래 데이터 없음) 조회할 법정동 자체가 없으므로
+    apt_recent_rank_service를 호출하지 않고 apt_recent_rank는 None이어야 한다."""
+    monkeypatch.setattr(dashboard_service.duckdb_client, "get_connection", lambda: MagicMock())
+    monkeypatch.setattr(dashboard_service.duckdb_client, "resolve_base_date", lambda *a, **k: "2026-08-30")
+    monkeypatch.setattr(
+        dashboard_service.duckdb_client, "resolve_base_date_for_filter", lambda *a, **k: "2026-08-30"
+    )
+    monkeypatch.setattr(dashboard_service, "_build_seoul_top5_districts", lambda *a, **k: [])
+    monkeypatch.setattr(
+        dashboard_service, "_build_price_change_top5", lambda *a, **k: {"rising_top5": [], "falling_top5": []}
+    )
+    monkeypatch.setattr(dashboard_service, "_build_preference_price_trend", lambda *a, **k: [])
+    monkeypatch.setattr(dashboard_service, "_build_top_trading_dongs", lambda *a, **k: [])
+    monkeypatch.setattr(dashboard_service, "_build_top_trading_apts", lambda *a, **k: [])
+
+    called = {"n": 0}
+
+    def fail_if_called(*a, **k):
+        called["n"] += 1
+
+    monkeypatch.setattr(dashboard_service.apt_recent_rank_service, "get_apt_recent_rank", fail_if_called)
+
+    result = dashboard_service.get_dashboard(cgg_cd="11680")
+
+    assert result["preference_popular_dong"] is None
+    assert result["apt_recent_rank"] is None
+    assert called["n"] == 0
+
+
 def test_get_dashboard_defaults_cgg_cd_when_blank(monkeypatch):
     monkeypatch.setattr(dashboard_service.duckdb_client, "get_connection", lambda: MagicMock())
     monkeypatch.setattr(

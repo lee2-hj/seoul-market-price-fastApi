@@ -31,6 +31,14 @@ def mart_base_path(mart_table: str) -> str:
     return f"s3://{settings.lake}/mart/{mart_table}"
 
 
+def silver_base_path(dataset: str) -> str:
+    """실버(Iceberg) 레이어 데이터셋의 테이블 경로. mart_base_path()와 달리 'mart/' 프리픽스 없이
+    lake(warehouse) 버킷 루트에 위치한다(예: fact_apt_transactions, dim_apartment). iceberg_scan()으로
+    읽어야 하는 실제 Iceberg 테이블이며(스키마가 파일마다 진화해 read_parquet 단순 glob은 스키마
+    불일치 에러가 날 수 있음), 이 경로는 iceberg_scan()의 인자로 그대로 사용한다."""
+    return f"s3://{settings.lake}/{dataset}"
+
+
 def list_base_dates(con: duckdb.DuckDBPyConnection, mart_table: str) -> list[str]:
     """mart_table에 존재하는 모든 base_date 파티션명을 최신순(내림차순)으로 정렬해 반환한다.
     resolve_base_date()와 resolve_base_date_for_filter()가 공통으로 사용하는 파티션 목록

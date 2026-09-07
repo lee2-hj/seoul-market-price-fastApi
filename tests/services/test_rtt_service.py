@@ -6,7 +6,18 @@ import logging
 from datetime import date, timedelta
 from unittest.mock import MagicMock
 
+import pytest
+
+from app.core import cache as cache_module
 from app.services import rtt_service
+
+
+@pytest.fixture(autouse=True)
+def _clear_anchor_fallback_cache():
+    """rtt_service의 앵커/실버 폴백 캐시(전역 dict)가 테스트 간에 남아있지 않도록 정리한다."""
+    cache_module.clear(rtt_service.CACHE_NAMESPACE)
+    yield
+    cache_module.clear(rtt_service.CACHE_NAMESPACE)
 
 
 def test_get_rtt_summary_shifts_window_when_naive_period_has_no_matching_trades(monkeypatch, caplog):
@@ -70,6 +81,81 @@ def test_get_rtt_summary_keeps_empty_result_when_no_match_at_all(monkeypatch):
 
     assert result["total_deal_cnt"] == 0
     assert result["recent_trades"] == []
+
+
+def test_get_rtt_summary_falls_back_to_silver_when_mart_retention_window_missed(monkeypatch, caplog):
+    """RTT는 최근 ~103일만 보존하는 롤링 마트라(실측: 2026-05-24~2026-09-04), 지역의 마지막
+    실거래가 그보다 오래되면 resolve_recent_match_date로도 영영 못 찾는다(실측으로 확인된 실제
+    케이스: sgg_cd=11110/dong_cd=16200 - RTT엔 없지만 fact_apt_transactions 원본에는 9건의
+    실거래가 있음, 마지막 거래일 2026-05-22). 이 경우 실버(fact_apt_transactions) 원본까지
+    온디맨드로 내려가 정상 집계해야 한다."""
+    monkeypatch.setattr(rtt_service.duckdb_client, "get_connection", lambda: MagicMock())
+    monkeypatch.setattr(rtt_service, "_fetch_rows", lambda *a, **k: [])
+    # RTT 마트 자체에는 매칭이 전혀 없다(보존 기간 밖).
+    monkeypatch.setattr(rtt_service.duckdb_client, "resolve_recent_match_date", lambda *a, **k: None)
+
+    silver_last_date = date(2026, 5, 22)
+    silver_rows = [
+        {
+            "sgg_cd": "11110", "sgg_nm": "종로구", "dong_cd": "16200", "dong_nm": "신당동",
+            "apt_name": "테스트단지", "mno": "1", "sno": "0",
+            "deal_date": silver_last_date.isoformat(), "floor": 5,
+            "trade_amount": 50000, "pyeong": 25.0, "exclusive_area_m2": 82.6, "trade_count": 1,
+        },
+        {
+            "sgg_cd": "11110", "sgg_nm": "종로구", "dong_cd": "16200", "dong_nm": "신당동",
+            "apt_name": "테스트단지2", "mno": "2", "sno": "0",
+            "deal_date": (silver_last_date - timedelta(days=10)).isoformat(), "floor": 3,
+            "trade_amount": 40000, "pyeong": 20.0, "exclusive_area_m2": 66.1, "trade_count": 1,
+        },
+    ]
+
+    def fake_fetch_silver_rows(con, sgg_cd, dong_cd):
+        assert (sgg_cd, dong_cd) == ("11110", "16200")
+        return silver_rows
+
+    monkeypatch.setattr(rtt_service, "_fetch_silver_rows", fake_fetch_silver_rows)
+
+    with caplog.at_level(logging.INFO, logger="app.services.rtt_service"):
+        result = rtt_service.get_rtt_summary(sgg_cd="11110", dong_cd="16200")
+
+    assert result["period_end"] == silver_last_date
+    assert result["sgg_nm"] == "종로구"
+    assert result["dong_nm"] == "신당동"
+    assert result["total_deal_cnt"] == 2
+    assert result["total_trade_amount"] == 90000
+    assert any("Silver fallback used" in r.message for r in caplog.records)
+
+
+def test_get_rtt_summary_silver_fallback_result_is_cached(monkeypatch):
+    """동일 지역을 연속 2회 조회하면 두 번째 호출은 캐시 히트로 처리되어 실버 스캔
+    (_fetch_silver_rows)이 다시 실행되지 않아야 한다."""
+    monkeypatch.setattr(rtt_service.duckdb_client, "get_connection", lambda: MagicMock())
+    monkeypatch.setattr(rtt_service, "_fetch_rows", lambda *a, **k: [])
+    monkeypatch.setattr(rtt_service.duckdb_client, "resolve_recent_match_date", lambda *a, **k: None)
+
+    calls: list[int] = []
+
+    def fake_fetch_silver_rows(con, sgg_cd, dong_cd):
+        calls.append(1)
+        return [
+            {
+                "sgg_cd": sgg_cd, "sgg_nm": "종로구", "dong_cd": dong_cd, "dong_nm": "신당동",
+                "apt_name": "테스트단지", "mno": "1", "sno": "0",
+                "deal_date": "2026-05-22", "floor": 5,
+                "trade_amount": 50000, "pyeong": 25.0, "exclusive_area_m2": 82.6, "trade_count": 1,
+            }
+        ]
+
+    monkeypatch.setattr(rtt_service, "_fetch_silver_rows", fake_fetch_silver_rows)
+
+    kwargs = dict(sgg_cd="11110", dong_cd="16200")
+    result_1 = rtt_service.get_rtt_summary(**kwargs)
+    result_2 = rtt_service.get_rtt_summary(**kwargs)
+
+    assert result_1["period_start"] == result_2["period_start"]
+    assert result_1["total_deal_cnt"] == result_2["total_deal_cnt"] == 1
+    assert len(calls) == 1  # 두 번째 호출은 캐시 히트라 실버 스캔이 다시 실행되지 않는다.
 
 
 def test_get_rtt_summary_does_not_call_fallback_when_naive_window_has_rows(monkeypatch):

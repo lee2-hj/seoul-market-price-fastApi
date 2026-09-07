@@ -2,6 +2,8 @@ from datetime import date
 
 from pydantic import BaseModel, Field
 
+from app.schemas.apt_recent_rank import AptRecentRankResponse
+
 
 class DashboardQuery(BaseModel):
     """`GET /api/v1/dashboard` 요청 Query Parameter."""
@@ -67,6 +69,7 @@ class PopularDong(BaseModel):
     """선호지역 내 거래량 1위 법정동."""
 
     cgg_nm: str = Field(..., description="자치구명")
+    stdg_cd: str = Field(..., description="법정동코드")
     stdg_nm: str = Field(..., description="법정동명")
 
 
@@ -111,4 +114,12 @@ class DashboardResponse(BaseModel):
     )
     preference_top_trading_apts: list[TopTradingAptItem] = Field(
         default_factory=list, description="선호지역 내 아파트 거래량 Top5"
+    )
+    apt_recent_rank: AptRecentRankResponse | None = Field(
+        default=None,
+        description=(
+            "preference_popular_dong(선호지역 내 거래량 1위 법정동) 기준, 그 법정동 내 최근 90일 "
+            "개별 실거래 Top5/Bottom5(apt-recent-rank 서비스의 전체 응답을 그대로 포함). "
+            "preference_popular_dong이 없으면(선호지역에 거래 데이터가 없음) null이다."
+        ),
     )
