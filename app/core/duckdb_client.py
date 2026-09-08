@@ -13,30 +13,33 @@ _PARTITION_PATTERN = re.compile(r"year=(\d{4})/month=(\d{2})/day=(\d{2})")
 
 logger = logging.getLogger(__name__)
 
-# 매 요청마다 duckdb.connect() + INSTALL/LOAD httpfs + S3 설정을 새로 하면(과거 방식), httpfs
-# 익스텐션 로딩과 S3 설정 자체의 오버헤드가 매 요청에 누적되어 응답 지연(nginx 499 유발)의 한
+# 매 요청마다 duckdb.connect() + INSTALL/LOAD httpfs를 새로 하면(과거 방식), httpfs 익스텐션
+# 로딩 자체의 오버헤드(디스크/네트워크 I/O)가 매 요청에 누적되어 응답 지연(nginx 499 유발)의 한
 # 원인이 된다. 그래서 프로세스당 단 하나의 "베이스" 커넥션만 최초 호출 시 지연 생성(lazy
-# singleton)해 재사용한다. DuckDB 커넥션 객체 자체는 여러 스레드에서 동시에 쓰기 안전하지
-# 않지만(FastAPI의 동기 엔드포인트는 starlette가 threadpool의 여러 스레드에서 동시 실행할 수
-# 있음), con.cursor()로 베이스 커넥션에서 파생된 커넥션은 같은 데이터베이스/설정(S3 인증 등)을
-# 공유하면서도 스레드마다 독립적으로 안전하게 사용할 수 있다(DuckDB 공식 권장 패턴). 그래서
-# get_connection()은 매 호출마다 새 cursor()를 반환하며, 호출부의 기존 `finally: con.close()`는
-# 그대로 유지된다 - cursor().close()는 그 핸들만 정리할 뿐 베이스 커넥션/DB는 살아있다.
+# singleton)해 익스텐션 설치만 재사용한다. DuckDB 커넥션 객체 자체는 여러 스레드에서 동시에 쓰기
+# 안전하지 않지만(FastAPI의 동기 엔드포인트는 starlette가 threadpool의 여러 스레드에서 동시
+# 실행할 수 있음), con.cursor()로 베이스 커넥션에서 파생된 커넥션은 같은 데이터베이스(로드된
+# 익스텐션 포함)를 공유하면서도 스레드마다 독립적으로 안전하게 사용할 수 있다(DuckDB 공식 권장
+# 패턴).
+#
+# 단, S3(MinIO 등) 접속 설정(SET s3_endpoint/s3_access_key_id/...)은 익스텐션 로드와 달리
+# 커넥션 로컬(session-local) 스코프라서 cursor()로 파생된 커넥션에는 자동으로 전파되지
+# 않는다 - 베이스 커넥션에만 SET해두면 cursor 쪽은 그 설정이 비어 기본 AWS S3 엔드포인트로
+# 요청이 나가버려 "NoSuchBucket: The specified bucket does not exist" 같은 오류가 난다(실제
+# 운영에서 재현된 버그). 그래서 S3 설정은 베이스 커넥션이 아니라 get_connection()이 반환하는
+# cursor 각각에 매번 적용한다 - INSTALL/LOAD와 달리 네트워크 I/O 없는 가벼운 SET이라 요청마다
+# 다시 실행해도 성능에 영향이 없다.
 _base_connection: duckdb.DuckDBPyConnection | None = None
 _base_connection_lock = threading.Lock()
 
 
 def _create_base_connection() -> duckdb.DuckDBPyConnection:
-    """MinIO(S3 호환) 접속이 설정된 인메모리 DuckDB 베이스 커넥션을 생성한다."""
+    """httpfs 익스텐션 설치/로드만 마친 인메모리 DuckDB 베이스 커넥션을 생성한다. S3 접속 설정은
+    여기서 하지 않는다(커넥션 로컬 스코프라 cursor()로 파생된 커넥션에 전파되지 않으므로) - 대신
+    get_connection()이 반환하는 cursor마다 _apply_s3_config()로 적용한다."""
     con = duckdb.connect(database=":memory:")
     con.execute("INSTALL httpfs;")
     con.execute("LOAD httpfs;")
-    con.execute(f"SET s3_endpoint = '{settings.s3_end_point}';")
-    con.execute(f"SET s3_access_key_id = '{settings.s3_access_key}';")
-    con.execute(f"SET s3_secret_access_key = '{settings.s3_secret_key}';")
-    con.execute(f"SET s3_url_style = '{settings.s3_url_style}';")
-    con.execute(f"SET s3_use_ssl = {'true' if settings.s3_use_ssl else 'false'};")
-    con.execute(f"SET s3_region = '{settings.aws_region}';")
     return con
 
 
@@ -49,10 +52,24 @@ def _get_base_connection() -> duckdb.DuckDBPyConnection:
     return _base_connection
 
 
+def _apply_s3_config(con: duckdb.DuckDBPyConnection) -> None:
+    """S3(MinIO 등) 접속 설정을 이 커넥션(cursor 포함)에 적용한다. 커넥션 로컬 스코프라 커넥션마다
+    다시 적용해야 하며, 네트워크 I/O가 없는 가벼운 SET이라 매 요청 재실행해도 무방하다."""
+    con.execute(f"SET s3_endpoint = '{settings.s3_end_point}';")
+    con.execute(f"SET s3_access_key_id = '{settings.s3_access_key}';")
+    con.execute(f"SET s3_secret_access_key = '{settings.s3_secret_key}';")
+    con.execute(f"SET s3_url_style = '{settings.s3_url_style}';")
+    con.execute(f"SET s3_use_ssl = {'true' if settings.s3_use_ssl else 'false'};")
+    con.execute(f"SET s3_region = '{settings.aws_region}';")
+
+
 def get_connection() -> duckdb.DuckDBPyConnection:
-    """모듈 레벨 싱글턴 베이스 커넥션에서 파생된 새 cursor()를 반환한다. 호출부 입장에서는 기존과
-    동일하게 '독립된 커넥션 하나'로 취급해 쓰고 finally에서 close()하면 된다."""
-    return _get_base_connection().cursor()
+    """모듈 레벨 싱글턴 베이스 커넥션(익스텐션 설치 완료)에서 파생된 새 cursor()에 S3 접속 설정을
+    적용해 반환한다. 호출부 입장에서는 기존과 동일하게 '독립된 커넥션 하나'로 취급해 쓰고
+    finally에서 close()하면 된다."""
+    con = _get_base_connection().cursor()
+    _apply_s3_config(con)
+    return con
 
 
 def mart_base_path(mart_table: str) -> str:
