@@ -2,6 +2,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Query
+from fastapi_cache.decorator import cache
 
 from app.schemas.dashboard import DashboardQuery, DashboardResponse
 from app.services import dashboard_service
@@ -10,6 +11,7 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 @router.get("", response_model=DashboardResponse)
+@cache(expire=300)  # DuckDB 마트 스캔이 5초 이상 걸려 nginx 499를 유발해, 5분간 응답을 인메모리 캐싱한다.
 def get_dashboard(
     query: Annotated[DashboardQuery, Query()],
 ) -> DashboardResponse:

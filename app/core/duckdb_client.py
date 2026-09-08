@@ -1,5 +1,6 @@
 import logging
 import re
+import threading
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -12,9 +13,21 @@ _PARTITION_PATTERN = re.compile(r"year=(\d{4})/month=(\d{2})/day=(\d{2})")
 
 logger = logging.getLogger(__name__)
 
+# 매 요청마다 duckdb.connect() + INSTALL/LOAD httpfs + S3 설정을 새로 하면(과거 방식), httpfs
+# 익스텐션 로딩과 S3 설정 자체의 오버헤드가 매 요청에 누적되어 응답 지연(nginx 499 유발)의 한
+# 원인이 된다. 그래서 프로세스당 단 하나의 "베이스" 커넥션만 최초 호출 시 지연 생성(lazy
+# singleton)해 재사용한다. DuckDB 커넥션 객체 자체는 여러 스레드에서 동시에 쓰기 안전하지
+# 않지만(FastAPI의 동기 엔드포인트는 starlette가 threadpool의 여러 스레드에서 동시 실행할 수
+# 있음), con.cursor()로 베이스 커넥션에서 파생된 커넥션은 같은 데이터베이스/설정(S3 인증 등)을
+# 공유하면서도 스레드마다 독립적으로 안전하게 사용할 수 있다(DuckDB 공식 권장 패턴). 그래서
+# get_connection()은 매 호출마다 새 cursor()를 반환하며, 호출부의 기존 `finally: con.close()`는
+# 그대로 유지된다 - cursor().close()는 그 핸들만 정리할 뿐 베이스 커넥션/DB는 살아있다.
+_base_connection: duckdb.DuckDBPyConnection | None = None
+_base_connection_lock = threading.Lock()
 
-def get_connection() -> duckdb.DuckDBPyConnection:
-    """MinIO(S3 호환) 접속이 설정된 인메모리 DuckDB 커넥션을 생성한다."""
+
+def _create_base_connection() -> duckdb.DuckDBPyConnection:
+    """MinIO(S3 호환) 접속이 설정된 인메모리 DuckDB 베이스 커넥션을 생성한다."""
     con = duckdb.connect(database=":memory:")
     con.execute("INSTALL httpfs;")
     con.execute("LOAD httpfs;")
@@ -25,6 +38,21 @@ def get_connection() -> duckdb.DuckDBPyConnection:
     con.execute(f"SET s3_use_ssl = {'true' if settings.s3_use_ssl else 'false'};")
     con.execute(f"SET s3_region = '{settings.aws_region}';")
     return con
+
+
+def _get_base_connection() -> duckdb.DuckDBPyConnection:
+    global _base_connection
+    if _base_connection is None:
+        with _base_connection_lock:
+            if _base_connection is None:  # double-checked locking
+                _base_connection = _create_base_connection()
+    return _base_connection
+
+
+def get_connection() -> duckdb.DuckDBPyConnection:
+    """모듈 레벨 싱글턴 베이스 커넥션에서 파생된 새 cursor()를 반환한다. 호출부 입장에서는 기존과
+    동일하게 '독립된 커넥션 하나'로 취급해 쓰고 finally에서 close()하면 된다."""
+    return _get_base_connection().cursor()
 
 
 def mart_base_path(mart_table: str) -> str:

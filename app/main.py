@@ -1,9 +1,12 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import FileResponse
+from fastapi_cache import FastAPICache
+from fastapi_cache.backends.inmemory import InMemoryBackend
 
 from app.api.routes import health
 from app.api.v1.router import router as api_v1_router
@@ -52,7 +55,17 @@ class _StripRootPathPrefixMiddleware:
         await self.app(scope, receive, send)
 
 
-app = FastAPI(title=settings.app_name, docs_url=None, redoc_url=None)
+# /api/v1/dashboard, /api/v1/rtt/summary, /api/v1/apt-trend/summary는 DuckDB로 S3(MinIO)
+# 마트를 직접 스캔해 5초 이상 걸릴 수 있어(nginx 499 유발), FastAPICache를 프로세스 인메모리
+# 백엔드로 초기화해 해당 엔드포인트들이 @cache(expire=300)로 5분간 응답을 재사용하게 한다.
+# on_event("startup")은 향후 FastAPI 버전에서 제거될 수 있는 구식 API라 lifespan으로 초기화한다.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    FastAPICache.init(InMemoryBackend(), prefix="fastapi-cache")
+    yield
+
+
+app = FastAPI(title=settings.app_name, docs_url=None, redoc_url=None, lifespan=lifespan)
 
 app.add_middleware(_StripRootPathPrefixMiddleware, prefix="/fastapi-direct")
 

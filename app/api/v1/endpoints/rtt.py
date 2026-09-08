@@ -2,6 +2,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Query
+from fastapi_cache.decorator import cache
 
 from app.schemas.rtt import RttSummaryQuery, RttSummaryResponse
 from app.services import rtt_service
@@ -10,6 +11,7 @@ router = APIRouter(prefix="/rtt", tags=["rtt"])
 
 
 @router.get("/summary", response_model=RttSummaryResponse)
+@cache(expire=300)  # DuckDB 마트 스캔이 5초 이상 걸려 nginx 499를 유발해, 5분간 응답을 인메모리 캐싱한다.
 def get_rtt_summary(
     query: Annotated[RttSummaryQuery, Query()],
 ) -> RttSummaryResponse:
