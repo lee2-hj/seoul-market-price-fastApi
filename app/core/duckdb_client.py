@@ -92,15 +92,35 @@ def list_base_dates(con: duckdb.DuckDBPyConnection, mart_table: str) -> list[str
 
 
 def resolve_base_date(con: duckdb.DuckDBPyConnection, mart_table: str) -> str:
-    """배치 당일 파티션을 우선 조회하고, 없으면 최신(MAX) base_date 파티션을 선택한다."""
-    today_str = date.today().isoformat()
-    base_path = mart_base_path(mart_table)
+    """mart_table에 존재하는 base_date 파티션 중 가장 최근 값을 반환한다.
 
-    today_pattern = f"{base_path}/base_date={today_str}/*.parquet"
-    if con.execute("SELECT COUNT(*) FROM glob($pattern)", {"pattern": today_pattern}).fetchone()[0] > 0:
-        return today_str
+    과거에는 `SELECT COUNT(*) FROM glob('.../base_date=오늘/*.parquet')`로 오늘 파티션의 존재
+    여부를 먼저 확인하고(있으면 그대로 사용), 없으면 list_base_dates()로 폴백했다. 하지만 실제로는
+    오늘 파티션에 parquet 파일이 정상적으로 존재하는데도
 
-    return list_base_dates(con, mart_table)[0]
+        duckdb.HTTPException: HTTP GET error reading 's3://.../base_date=2026-09-08' (HTTP 404)
+
+    가 발생하는 사례가 확인됐다 - 특정 파티션 "폴더" 경로를 glob으로 직접 겨냥하면, 백엔드
+    오브젝트 스토리지(GCS의 S3 호환 API 등)의 목록 조회 결과에 실제 parquet 파일이 아닌 그 폴더
+    "키" 자체가 섞여 들어오는 경우가 있고, 이를 실제 오브젝트인 것처럼 GET하려다 404가 난다.
+
+    그래서 특정 파티션 폴더를 콕 집어 존재 여부를 확인하는 대신, mart_table 전체를 재귀
+    와일드카드(`**/*.parquet`)로 read_parquet에 넘겨 hive_partitioning으로 노출되는 base_date
+    컬럼의 MAX 값을 SQL 집계로 직접 구한다. 이 경로는 실제로 열 수 있는 parquet 파일들만
+    대상으로 하므로 위 문제가 재현되지 않는다. '오늘 파티션 우선'이라는 과거 동작과 결과도
+    동일하다 - 정상적인 배치 파이프라인이라면 미래 날짜 파티션이 있을 수 없으므로, 오늘
+    파티션이 존재한다면 그것이 항상 전체 MAX와 같기 때문이다."""
+    recursive_pattern = f"{mart_base_path(mart_table)}/**/*.parquet"
+    row = con.execute(
+        "SELECT MAX(base_date) FROM read_parquet($pattern, hive_partitioning = true)",
+        {"pattern": recursive_pattern},
+    ).fetchone()
+
+    max_base_date = row[0] if row else None
+    if max_base_date is None:
+        raise FileNotFoundError(f"'{mart_table}' 마트에서 조회 가능한 base_date 파티션을 찾을 수 없습니다.")
+
+    return max_base_date.isoformat() if hasattr(max_base_date, "isoformat") else str(max_base_date)
 
 
 def resolve_base_date_for_filter(
