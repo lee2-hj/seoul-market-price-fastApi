@@ -4,7 +4,6 @@ from datetime import date, timedelta
 from typing import Any
 
 from app.core import duckdb_client
-from app.core.cache import cached_call
 from app.core.config import settings
 
 # apt_mkt_trends 마트 실제 컬럼(DESCRIBE로 확인):
@@ -19,20 +18,6 @@ MART_TABLE = "apt_mkt_trends"
 PERIOD_DAYS = 90
 BIWEEKLY_BUCKET_COUNT = 6
 PYEONG_DIVISOR = 3.305785
-
-# --- 실버(Iceberg fact) 레이어 Fallback -------------------------------------------------
-# apt_mkt_trends는 "전체 이력"이 아니라 최근 ~100여 일만 보존하는 롤링 마트다(실측 확인: 특정
-# 시점 기준 MIN(deal_date)~MAX(deal_date) 범위가 약 100일 폭으로 계속 밀려 있음). 그래서
-# resolve_recent_match_date로 이 마트 전체를 뒤져도, 단지의 마지막 실거래가 그 보존 기간보다
-# 오래됐으면(예: 마지막 거래가 100일도 더 전) 영원히 매칭되지 않는다 - 이 마트 자체가 "골드
-# 레이어에 데이터가 누락된 단지" 상태다. 이 경우 원본 실거래 팩트 테이블(fact_apt_transactions,
-# Iceberg)까지 온디맨드로 내려가 [마지막 거래일 - 89일 ~ 마지막 거래일] 구간을 집계한다.
-SILVER_TABLE = settings.silver_apt_transactions_table
-
-# 앵커(조회 창 기준일) 이동으로 재조회한 결과(apt_mkt_trends 재스캔이든 fact_apt_transactions
-# Fallback이든)는 단지 식별자 키로 최소 1시간 캐싱해 동일 단지 반복 요청 시 스토리지 I/O를
-# 원천 차단한다.
-CACHE_NAMESPACE = "apt_trend:anchor_fallback"
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +40,7 @@ def _build_entity_conditions(
     apt_name: str | None,
 ) -> tuple[list[str], dict[str, Any]]:
     """날짜 조건을 제외한, 단지 필터(cgg_cd/stdg_cd/mno/sno/apt_name) 조건 목록과 파라미터.
-    range-앵커 폴백(resolve_recent_match_date)은 날짜 범위 없이 이 조건만으로 이력 전체를
-    조회해야 하므로, 날짜 조건이 항상 포함되는 _build_where_clause와 분리했다."""
+    날짜 조건(deal_date BETWEEN ...)이 항상 포함되는 _build_where_clause가 재사용한다."""
     conditions: list[str] = []
     params: dict[str, Any] = {}
     if cgg_cd:
@@ -93,6 +77,25 @@ def _build_where_clause(
     return "WHERE " + " AND ".join(conditions), params
 
 
+def _log_explain_analyze(con, query: str, params: dict[str, Any]) -> None:
+    """settings.apt_trend_explain_analyze가 켜져 있을 때만 이 쿼리를 EXPLAIN ANALYZE로 한 번 더
+    실행해 실행계획+실측 소요시간(단계별 operator timing)을 로그로 남긴다 — 캐시 미스 시 49초
+    가까이 걸리는 원인(예: read_parquet가 base_date 파티션 프루닝 없이 마트 전체 이력을 스캔한 뒤
+    deal_date 필터를 뒤늦게 적용하는지 등)을 확인하기 위한 임시 진단 도구다.
+
+    EXPLAIN ANALYZE는 실행계획만 보여주는 게 아니라 쿼리를 실제로 다시 한번 실행하므로, 상시
+    켜두면 캐시 미스 시 응답 시간이 거의 2배가 된다 - 기본값 False로 두고, 진단이 필요할 때만
+    APT_TREND_EXPLAIN_ANALYZE=true로 켜서 로그를 확인한 뒤 다시 꺼야 한다."""
+    if not settings.apt_trend_explain_analyze:
+        return
+    try:
+        plan_rows = con.execute(f"EXPLAIN ANALYZE {query}", params).fetchall()
+        plan_text = "\n".join(str(cell) for row in plan_rows for cell in row)
+        logger.info("[EXPLAIN ANALYZE] apt_trend_service._fetch_rows:\n%s", plan_text)
+    except Exception:
+        logger.exception("EXPLAIN ANALYZE 실행 중 오류 발생(진단 목적이므로 본 요청 조회는 계속 진행)")
+
+
 def _fetch_rows(
     con,
     cgg_cd: str | None,
@@ -103,8 +106,13 @@ def _fetch_rows(
     start_date: date,
     end_date: date,
 ) -> list[dict[str, Any]]:
-    """apt_mkt_trends 마트(재귀 glob, base_date 파티션 전체) 에서 필터 조건에 맞는 row를 조회한다."""
-    parquet_glob = f"{duckdb_client.mart_base_path(MART_TABLE)}/**/*.parquet"
+    """apt_mkt_trends 마트의 최신 base_date 파티션에서 필터 조건에 맞는 row를 조회한다. 과거에는
+    base_date 파티션 전체를 재귀 glob(`/**/*.parquet`)으로 스캔했으나(캐시 미스 시 49초 가까이
+    소요), 이 마트는 이미 최신 파티션 자체가 최근 90일치 롤링 윈도우를 담고 있으므로 최신 파티션
+    하나만 읽으면 충분하다. 이 최신 파티션에도 조건에 맞는 데이터가 없으면 빈 결과를 그대로
+    반환한다(과거 파티션/실버(Iceberg) 레이어까지 거슬러 올라가는 폴백은 없음)."""
+    latest_base_date = duckdb_client.resolve_base_date(con, MART_TABLE)
+    parquet_glob = f"{duckdb_client.mart_base_path(MART_TABLE)}/base_date={latest_base_date}/*.parquet"
     where_clause, params = _build_where_clause(cgg_cd, stdg_cd, mno, sno, apt_name, start_date, end_date)
     query = f"""
         SELECT
@@ -113,6 +121,7 @@ def _fetch_rows(
         FROM read_parquet('{parquet_glob}')
         {where_clause}
     """
+    _log_explain_analyze(con, query, params)
     result = con.execute(query, params)
     return duckdb_client.rows_to_dicts(result)
 
@@ -294,118 +303,6 @@ def _build_apt_trend_item(
     }
 
 
-def _build_silver_entity_conditions(
-    cgg_cd: str | None,
-    stdg_cd: str | None,
-    mno: str | None,
-    sno: str | None,
-    apt_name: str | None,
-) -> tuple[list[str], dict[str, Any]]:
-    """_build_entity_conditions()의 실버(fact_apt_transactions) 버전. 조건 의미는 완전히
-    동일하지만(자치구/법정동/지번/아파트명 부분일치), 컬럼명이 다르다
-    (cgg_cd/stdg_cd -> sgg_cd/dong_cd). 취소된 거래(cancel_date가 채워진 행)는 항상 제외한다
-    (apt_mkt_trends는 이미 취소 반영 후 적재된 마트라 이 필터가 필요 없지만, 원본 팩트
-    테이블은 취소 여부를 그대로 갖고 있다)."""
-    conditions: list[str] = ["(cancel_date IS NULL OR cancel_date = '')"]
-    params: dict[str, Any] = {}
-    if cgg_cd:
-        conditions.append("sgg_cd = $sgg_cd")
-        params["sgg_cd"] = cgg_cd
-    if stdg_cd:
-        conditions.append("dong_cd = $dong_cd")
-        params["dong_cd"] = stdg_cd
-    if mno:
-        conditions.append("mno = $mno")
-        params["mno"] = mno
-    if sno:
-        conditions.append("sno = $sno")
-        params["sno"] = sno
-    if apt_name and apt_name.strip():
-        conditions.append("apt_name ILIKE $apt_name")
-        params["apt_name"] = f"%{apt_name.strip()}%"
-    return conditions, params
-
-
-def _fetch_silver_rows(
-    con,
-    cgg_cd: str | None,
-    stdg_cd: str | None,
-    mno: str | None,
-    sno: str | None,
-    apt_name: str | None,
-) -> list[dict[str, Any]] | None:
-    """apt_mkt_trends 마트 자체의 앵커 폴백(_recompute_shifted_window)도 매칭 데이터를 찾지
-    못했을 때(=이 마트의 ~100여 일 보존 기간 자체를 벗어난 단지, 모듈 상단 주석 참고) 마지막
-    수단으로 실버(fact_apt_transactions, Iceberg) 원본 팩트 테이블에서 이 단지의
-    [마지막 거래일 - 89일 ~ 마지막 거래일] 구간을 온디맨드로 스캔한다.
-
-    한 번의 스캔(matched CTE)으로 이 단지 조건(및 취소 제외)으로 먼저 좁힌 뒤, 그 결과 안에서만
-    MAX(deal_date)와 90일 윈도우 슬라이싱을 수행한다. apt_mkt_trends와 동일한 그룹 키
-    (deal_date, floor, pyeong)로 합산해(같은 조합에 몰린 거래건을 하나로 묶는 apt_mkt_trends의
-    기존 관례와 동일) trade_count/trade_amount를 만들고, pyeong은 apt_mkt_trends와 동일하게
-    순수 전용면적 환산(exclusive_area_m2 / PYEONG_DIVISOR, 소수 둘째 자리 반올림)이다 -
-    region_apt_compare_service(dm_apt_recent_trade)에서 쓰인 공급면적 배수(1.3)는 여기 적용하지
-    않는다(실측 교차검증: apt_mkt_trends 자체가 이 배수 없이 저장돼 있음을 확인했다).
-
-    반환 row는 기존 _fetch_rows()와 완전히 동일한 키 구조(cgg_cd/cgg_nm/stdg_cd/stdg_nm/
-    apt_name/mno/sno/deal_date/floor/trade_amount/pyeong/trade_count)라, 이후의 그룹화·집계
-    로직(_build_apt_trend_item 등)을 한 글자도 바꾸지 않고 그대로 재사용한다(cgg_nm/stdg_nm은
-    fact_apt_transactions에 없는 지역명이라 dim_apartment에서 보완한다).
-
-    이 단지의 거래 이력이 fact_apt_transactions에도 전혀 없으면 None을 반환한다."""
-    con.execute("INSTALL iceberg;")
-    con.execute("LOAD iceberg;")
-
-    conditions, params = _build_silver_entity_conditions(cgg_cd, stdg_cd, mno, sno, apt_name)
-    params["path"] = duckdb_client.silver_base_path(SILVER_TABLE)
-    query = f"""
-        WITH matched AS (
-            SELECT sgg_cd, dong_cd, apt_name, mno, sno, deal_date, floor, price_ten_thousand, exclusive_area_m2
-            FROM iceberg_scan($path)
-            WHERE {" AND ".join(conditions)}
-        ),
-        bounds AS (
-            SELECT MAX(deal_date) AS last_date FROM matched
-        ),
-        windowed AS (
-            SELECT
-                m.sgg_cd, m.dong_cd, m.apt_name, m.mno, m.sno, m.deal_date, m.floor,
-                ROUND(m.exclusive_area_m2 / {PYEONG_DIVISOR}, 2) AS pyeong,
-                m.price_ten_thousand
-            FROM matched m, bounds b
-            WHERE b.last_date IS NOT NULL
-              AND m.deal_date BETWEEN b.last_date - INTERVAL {PERIOD_DAYS} DAY AND b.last_date
-        )
-        SELECT
-            sgg_cd AS cgg_cd, dong_cd AS stdg_cd, apt_name, mno, sno, deal_date, floor, pyeong,
-            CAST(ROUND(SUM(price_ten_thousand)) AS BIGINT) AS trade_amount,
-            COUNT(*) AS trade_count
-        FROM windowed
-        GROUP BY sgg_cd, dong_cd, apt_name, mno, sno, deal_date, floor, pyeong
-    """
-    rows = duckdb_client.rows_to_dicts(con.execute(query, params))
-    if not rows:
-        return None
-
-    name_query = """
-        SELECT ANY_VALUE(sgg_nm) AS cgg_nm, ANY_VALUE(dong_nm) AS stdg_nm
-        FROM iceberg_scan($path)
-        WHERE sgg_cd = $sgg_cd AND dong_cd = $dong_cd
-    """
-    name_params = {
-        "path": duckdb_client.silver_base_path("dim_apartment"),
-        "sgg_cd": cgg_cd,
-        "dong_cd": stdg_cd,
-    }
-    name_rows = duckdb_client.rows_to_dicts(con.execute(name_query, name_params))
-    cgg_nm = name_rows[0]["cgg_nm"] if name_rows else None
-    stdg_nm = name_rows[0]["stdg_nm"] if name_rows else None
-    for row in rows:
-        row["cgg_nm"] = cgg_nm
-        row["stdg_nm"] = stdg_nm
-    return rows
-
-
 def get_apt_trend_summary(
     *,
     cgg_cd: str | None,
@@ -420,18 +317,10 @@ def get_apt_trend_summary(
     apt_name이 주어지면 실제 apt_name 컬럼을 SQL WHERE(ILIKE)에서 부분일치 필터링한다(다른 마트를
     조인하지 않는다).
 
-    이 90일 창(오늘 기준)에 조건에 맞는 거래가 하나도 없으면, 날짜 범위 제한 없이 apt_mkt_trends
-    전체(단, ~100여 일만 보존되는 롤링 마트)에서 조건에 매칭되는 가장 최근 deal_date를 한 번에
-    찾아(`resolve_recent_match_date`) 그 날짜를 새 end_date로 삼아 90일 창 전체를 그 시점으로
-    이동시켜 재조회한다("파티션 폴백"이 아니라 "조회 창의 기준일(anchor) 이동"). 이동된 시작일이
-    원래 창의 시작일보다 settings.max_base_date_lookback일 이상 더 과거이면 이동하지 않는다.
-
-    apt_mkt_trends 안에서도 매칭이 안 되면(=이 마트의 보존 기간 자체보다 오래된 단지), 마지막
-    수단으로 실버(fact_apt_transactions, Iceberg) 원본 팩트 테이블까지 온디맨드로 내려가 이 단지의
-    [마지막 거래일 - 89일 ~ 마지막 거래일] 구간을 집계한다(_fetch_silver_rows). 이렇게 재조회/폴백된
-    결과는 단지 식별자 키로 최소 1시간 캐싱된다. 그래도 거래 이력 자체가 전혀 없으면 창을 이동하지
-    않고 기존처럼 빈 결과를 그대로 반환한다(에러 아님). 창이 실제로 이동된 경우
-    search_period.start_date/end_date는 "오늘 기준 90일"이 아니라 이동된 실제 구간을 반영한다.
+    이 90일 창(오늘 기준)에 조건에 맞는 거래가 하나도 없으면(apt_mkt_trends의 최신 base_date
+    파티션에 이 단지 데이터가 없는 경우), 과거 파티션이나 실버(fact_apt_transactions, Iceberg)
+    레이어로 거슬러 올라가지 않고 빈 결과를 그대로 반환한다(에러 아님) - 항상 최신 base_date
+    데이터만 조회한다.
 
     count_change_rate는 biweekly_trend(90일을 6구간으로 균등 분할한 거래량)에서 거래가 있는
     구간끼리만 순서대로 짝지어(0건 구간은 짝짓기에서 제외) 증감률을 계산하고, 각 스텝 뒤쪽 구간의
@@ -441,72 +330,6 @@ def get_apt_trend_summary(
     con = duckdb_client.get_connection()
     try:
         rows = _fetch_rows(con, cgg_cd, stdg_cd, mno, sno, apt_name, start_date, end_date)
-
-        if not rows:
-            naive_start, naive_end = start_date, end_date
-
-            def _recompute_shifted_window() -> tuple[list[dict[str, Any]], date, date] | None:
-                """이 단지 조건에 매칭되는 가장 최근 deal_date로 90일 창을 이동시켜 재조회한다.
-                이동할 수 없으면(매칭 자체가 없거나 lookback 상한을 넘으면) None을 반환해
-                호출자가 나이브 빈 결과를 그대로 쓰게 한다. 캐싱 대상은 이 함수의 반환값
-                (재조회된 rows + 이동된 실제 구간)이다."""
-                entity_conditions, entity_params = _build_entity_conditions(
-                    cgg_cd, stdg_cd, mno, sno, apt_name
-                )
-                match_where = ("WHERE " + " AND ".join(entity_conditions)) if entity_conditions else ""
-                full_glob = f"{duckdb_client.mart_base_path(MART_TABLE)}/**/*.parquet"
-                matched_date = duckdb_client.resolve_recent_match_date(
-                    con, full_glob, "deal_date", match_where, entity_params
-                )
-                if matched_date is not None and matched_date >= naive_start - timedelta(
-                    days=settings.max_base_date_lookback
-                ):
-                    shifted_end = matched_date
-                    shifted_start = shifted_end - timedelta(days=PERIOD_DAYS)
-                    shifted_rows = _fetch_rows(
-                        con, cgg_cd, stdg_cd, mno, sno, apt_name, shifted_start, shifted_end
-                    )
-                    logger.info(
-                        "Anchor fallback used for table=%s, condition_summary=%s, "
-                        "naive_window=%s~%s, matched_window=%s~%s",
-                        MART_TABLE,
-                        (match_where or "(no filter)")[:100],
-                        naive_start,
-                        naive_end,
-                        shifted_start,
-                        shifted_end,
-                    )
-                    return shifted_rows, shifted_start, shifted_end
-
-                # apt_mkt_trends 자체에서 못 찾았으면(마트 보존기간 밖으로 벗어난 단지) 마지막
-                # 수단으로 실버 원본(fact_apt_transactions)까지 온디맨드로 내려간다.
-                silver_rows = _fetch_silver_rows(con, cgg_cd, stdg_cd, mno, sno, apt_name)
-                if silver_rows is None:
-                    return None
-
-                shifted_end = date.fromisoformat(max(r["deal_date"] for r in silver_rows))
-                shifted_start = shifted_end - timedelta(days=PERIOD_DAYS)
-                logger.info(
-                    "Silver fallback used for table=%s, condition_summary=%s, "
-                    "naive_window=%s~%s, silver_window=%s~%s",
-                    SILVER_TABLE,
-                    (match_where or "(no filter)")[:100],
-                    naive_start,
-                    naive_end,
-                    shifted_start,
-                    shifted_end,
-                )
-                return silver_rows, shifted_start, shifted_end
-
-            # Fallback으로 계산된 결과(재조회 rows + 이동된 구간)는 단지 식별자 키로 최소 1시간
-            # 캐싱되어, 동일 단지 반복 요청 시 resolve_recent_match_date/재조회 스캔을 다시
-            # 수행하지 않는다("매칭 자체가 없다"는 None 결과도 함께 캐싱한다).
-            cache_key = (cgg_cd, stdg_cd, mno, sno, apt_name)
-            cached_result = cached_call(CACHE_NAMESPACE, cache_key, _recompute_shifted_window)
-            if cached_result is not None:
-                rows, start_date, end_date = cached_result
-            # matched_date가 없거나 lookback 상한을 넘으면 rows/기간은 나이브 값 그대로 —
-            # 기존과 동일하게 빈 결과 반환(에러 아님).
     finally:
         con.close()
 

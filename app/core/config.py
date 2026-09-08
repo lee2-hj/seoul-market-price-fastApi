@@ -37,5 +37,11 @@ class Settings(BaseSettings):
     silver_fallback_cache_ttl_seconds: int = 3600
     silver_fallback_cache_maxsize: int = 2048
 
+    # apt-trend/summary 진단용: apt_mkt_trends 전체 스캔 쿼리가 캐시 미스 시 49초 가까이 걸리는
+    # 원인을 찾기 위해, True면 그 쿼리를 EXPLAIN ANALYZE로 한 번 더 실행해 실행계획+실측 소요시간을
+    # 로그로 남긴다. EXPLAIN ANALYZE는 쿼리를 실제로 다시 실행하므로 켜두면 캐시 미스 시 응답
+    # 시간이 거의 2배가 된다 - 원인 파악 후에는 반드시 False로 되돌릴 것.
+    apt_trend_explain_analyze: bool = False
+
 
 settings = Settings()

@@ -4,8 +4,6 @@ from datetime import date, timedelta
 from typing import Any
 
 from app.core import duckdb_client
-from app.core.cache import cached_call
-from app.core.config import settings
 
 MART_TABLE = "RTT"
 PERIOD_DAYS = 90
@@ -13,20 +11,7 @@ HALF_PERIOD_DAYS = PERIOD_DAYS // 2
 BIWEEKLY_BUCKET_COUNT = 6
 RECENT_TRADES_LIMIT = 20
 TOP_VOLUME_LIMIT = 5
-
-# --- 실버(Iceberg fact) 레이어 Fallback -------------------------------------------------
-# RTT 마트 자체가 실측 확인 결과 fact_apt_transactions의 1:1 행 단위 프로젝션이다(trade_count
-# 컬럼은 모든 row에서 항상 1이고, trade_amount/pyeong/exclusive_area_m2가 원본 price_ten_thousand/
-# exclusive_area_m2*PYEONG_DIVISOR와 정확히 일치 - 그룹 합산이 전혀 없다). 다만 RTT도 apt_mkt_trends와
-# 마찬가지로 최근 ~103일(실측: 2026-05-24~2026-09-04)만 보존하는 롤링 마트라, 그 지역(sgg_cd,
-# +dong_cd)의 마지막 실거래가 그보다 오래되면(예: 신당동 등 거래가 뜸한 법정동) resolve_recent_match_date로도
-# 영원히 못 찾는다. 이 경우 fact_apt_transactions 원본까지 온디맨드로 내려가 [그 지역의 마지막 거래일 -
-# 89일 ~ 마지막 거래일] 구간을 그대로 가져온다. RTT가 원본의 단순 재구성이므로, 실버 row를 RTT와
-# 완전히 동일한 컬럼 구조로 매핑하면 기존 집계 함수(_build_totals 등)를 한 글자도 바꾸지 않고 재사용할
-# 수 있다.
-SILVER_TABLE = settings.silver_apt_transactions_table
 PYEONG_DIVISOR = 3.305785
-CACHE_NAMESPACE = "rtt:anchor_fallback"
 
 logger = logging.getLogger(__name__)
 
@@ -238,160 +223,18 @@ def _build_top5_by_volume(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _fetch_silver_rows(con, sgg_cd: str, dong_cd: str | None) -> list[dict[str, Any]] | None:
-    """RTT 마트 자체의 앵커 폴백도 매칭 데이터를 찾지 못했을 때(=이 마트의 ~103일 보존 기간 자체를
-    벗어난 지역, 모듈 상단 주석 참고) 마지막 수단으로 실버(fact_apt_transactions, Iceberg) 원본
-    팩트 테이블에서 이 지역(sgg_cd, +dong_cd)의 [마지막 거래일 - 89일 ~ 마지막 거래일] 구간을
-    온디맨드로 스캔한다.
-
-    RTT는 fact_apt_transactions의 1:1 재구성이므로(trade_count 항상 1, 그룹 합산 없음), 취소된
-    거래(cancel_date 존재)만 제외하고 원본 컬럼을 그대로 RTT와 동일한 키(sgg_cd/sgg_nm/dong_cd/
-    dong_nm/apt_name/mno/sno/deal_date/floor/trade_amount/pyeong/exclusive_area_m2/trade_count)로
-    매핑해 반환한다. sgg_nm/dong_nm은 fact_apt_transactions에 없어 dim_apartment에서 보완한다
-    (dong_cd 미지정 시 자치구 내 여러 법정동이 섞일 수 있어 법정동코드별로 이름을 매핑한다).
-
-    이 지역에 거래 이력이 fact_apt_transactions에도 전혀 없으면 None을 반환한다."""
-    con.execute("INSTALL iceberg;")
-    con.execute("LOAD iceberg;")
-
-    conditions = ["sgg_cd = $sgg_cd", "(cancel_date IS NULL OR cancel_date = '')"]
-    params: dict[str, Any] = {"sgg_cd": sgg_cd}
-    if dong_cd:
-        conditions.append("dong_cd = $dong_cd")
-        params["dong_cd"] = dong_cd
-    params["path"] = duckdb_client.silver_base_path(SILVER_TABLE)
-
-    query = f"""
-        WITH matched AS (
-            SELECT deal_date, dong_cd, apt_name, mno, sno, floor, price_ten_thousand, exclusive_area_m2
-            FROM iceberg_scan($path)
-            WHERE {" AND ".join(conditions)}
-        ),
-        bounds AS (
-            SELECT MAX(deal_date) AS last_date FROM matched
-        )
-        SELECT
-            m.dong_cd, m.apt_name, m.mno, m.sno, m.deal_date, m.floor,
-            CAST(ROUND(m.price_ten_thousand) AS BIGINT) AS trade_amount,
-            ROUND(m.exclusive_area_m2 / {PYEONG_DIVISOR}, 2) AS pyeong,
-            m.exclusive_area_m2,
-            1 AS trade_count
-        FROM matched m, bounds b
-        WHERE b.last_date IS NOT NULL
-          AND m.deal_date BETWEEN b.last_date - INTERVAL {PERIOD_DAYS - 1} DAY AND b.last_date
-    """
-    rows = duckdb_client.rows_to_dicts(con.execute(query, params))
-    if not rows:
-        return None
-
-    name_query = """
-        SELECT dong_cd, ANY_VALUE(sgg_nm) AS sgg_nm, ANY_VALUE(dong_nm) AS dong_nm
-        FROM iceberg_scan($path)
-        WHERE sgg_cd = $sgg_cd
-        GROUP BY dong_cd
-    """
-    name_rows = duckdb_client.rows_to_dicts(
-        con.execute(
-            name_query,
-            {"path": duckdb_client.silver_base_path("dim_apartment"), "sgg_cd": sgg_cd},
-        )
-    )
-    names_by_dong = {r["dong_cd"]: r for r in name_rows}
-
-    for row in rows:
-        row["sgg_cd"] = sgg_cd
-        names = names_by_dong.get(row["dong_cd"], {})
-        row["sgg_nm"] = names.get("sgg_nm")
-        row["dong_nm"] = names.get("dong_nm")
-    return rows
-
-
 def get_rtt_summary(*, sgg_cd: str, dong_cd: str | None = None) -> dict[str, Any]:
     """기본적으로 오늘 기준 최근 90일간 sgg_cd(+dong_cd, 선택) 조건의 RTT(실거래) 데이터를 집계하여 단일
     JSON으로 반환한다. dong_cd가 없으면 자치구 내 모든 법정동의 거래내역을 대상으로 동일한 로직을 그대로
     적용해 합산한다.
 
-    이 90일 창(오늘 기준)에 조건에 맞는 거래가 하나도 없으면(예: 최근에 거래가 뜸한 지역), 파티션을 하나씩
-    확인하는 대신 날짜 범위 제한 없이 RTT 마트 전체(단, ~103일만 보존되는 롤링 마트)에서 조건에 매칭되는
-    가장 최근 base_date를 한 번에 찾아(`resolve_recent_match_date`), 그 날짜를 새 end_date로 삼아 90일
-    창 전체를 그 시점으로 이동시켜 재조회한다("파티션 폴백"이 아니라 "조회 창의 기준일(anchor) 이동").
-    이동된 시작일이 원래 창의 시작일보다 settings.max_base_date_lookback일 이상 더 과거이면 이동하지 않는다.
-
-    RTT 마트 안에서도 매칭이 안 되면(=이 마트의 보존 기간 자체보다 오래된 지역), 마지막 수단으로 실버
-    (fact_apt_transactions, Iceberg) 원본 팩트 테이블까지 온디맨드로 내려가 이 지역의 [마지막 거래일 -
-    89일 ~ 마지막 거래일] 구간을 그대로 가져온다(_fetch_silver_rows - RTT 자체가 원본의 1:1 행 단위
-    재구성이라 별도 집계식 변환 없이 동일한 컬럼 구조로 재사용 가능하다). 재조회/폴백된 결과는 지역
-    식별자 키로 최소 1시간 캐싱된다. 그래도 거래 이력 자체가 전혀 없으면 창을 이동하지 않고 기존처럼
-    빈 결과를 그대로 반환한다(에러 아님). 창이 실제로 이동된 경우 period_start/period_end는 "오늘 기준
-    90일"이 아니라 이동된 실제 구간을 반영한다."""
+    이 90일 창(오늘 기준)에 조건에 맞는 거래가 하나도 없으면(예: 최근에 거래가 뜸한 지역), 과거
+    base_date나 실버(fact_apt_transactions, Iceberg) 레이어로 거슬러 올라가지 않고 빈 결과를
+    그대로 반환한다(에러 아님) - 항상 최신 base_date 데이터만 조회한다."""
     start_date, end_date = _period_range(date.today())
     con = duckdb_client.get_connection()
     try:
         rows = _fetch_rows(con, sgg_cd, dong_cd, start_date, end_date)
-
-        if not rows:
-            naive_start, naive_end = start_date, end_date
-
-            def _recompute_shifted_window() -> tuple[list[dict[str, Any]], date, date] | None:
-                """이 지역 조건에 매칭되는 가장 최근 base_date로 90일 창을 이동시켜 재조회한다.
-                RTT 마트 안에서도 못 찾으면(마트 보존기간 밖) 마지막 수단으로 실버 원본
-                (fact_apt_transactions)까지 온디맨드로 내려간다. 캐싱 대상은 이 함수의 반환값이다."""
-                match_where = "WHERE sgg_cd = $sgg_cd" + (" AND dong_cd = $dong_cd" if dong_cd else "")
-                match_params: dict[str, Any] = {
-                    "sgg_cd": sgg_cd,
-                    **({"dong_cd": dong_cd} if dong_cd else {}),
-                }
-                full_glob = f"{duckdb_client.mart_base_path(MART_TABLE)}/base_date=*/data.parquet"
-                matched_date = duckdb_client.resolve_recent_match_date(
-                    con, full_glob, "base_date", match_where, match_params
-                )
-                if matched_date is not None and matched_date >= naive_start - timedelta(
-                    days=settings.max_base_date_lookback
-                ):
-                    shifted_end = matched_date
-                    shifted_start = shifted_end - timedelta(days=PERIOD_DAYS - 1)
-                    shifted_rows = _fetch_rows(con, sgg_cd, dong_cd, shifted_start, shifted_end)
-                    logger.info(
-                        "Anchor fallback used for table=%s, condition_summary=%s, "
-                        "naive_window=%s~%s, matched_window=%s~%s",
-                        MART_TABLE,
-                        match_where[:100],
-                        naive_start,
-                        naive_end,
-                        shifted_start,
-                        shifted_end,
-                    )
-                    return shifted_rows, shifted_start, shifted_end
-
-                # RTT 자체에서 못 찾았으면(마트 보존기간 밖으로 벗어난 지역) 마지막 수단으로 실버
-                # 원본(fact_apt_transactions)까지 온디맨드로 내려간다.
-                silver_rows = _fetch_silver_rows(con, sgg_cd, dong_cd)
-                if silver_rows is None:
-                    return None
-
-                shifted_end = date.fromisoformat(max(r["deal_date"] for r in silver_rows))
-                shifted_start = shifted_end - timedelta(days=PERIOD_DAYS - 1)
-                logger.info(
-                    "Silver fallback used for table=%s, condition_summary=%s, "
-                    "naive_window=%s~%s, silver_window=%s~%s",
-                    SILVER_TABLE,
-                    match_where[:100],
-                    naive_start,
-                    naive_end,
-                    shifted_start,
-                    shifted_end,
-                )
-                return silver_rows, shifted_start, shifted_end
-
-            # Fallback으로 계산된 결과(재조회 rows + 이동된 구간)는 지역 식별자 키로 최소 1시간
-            # 캐싱되어, 동일 지역 반복 요청 시 resolve_recent_match_date/재조회 스캔을 다시
-            # 수행하지 않는다("매칭 자체가 없다"는 None 결과도 함께 캐싱한다).
-            cache_key = (sgg_cd, dong_cd)
-            cached_result = cached_call(CACHE_NAMESPACE, cache_key, _recompute_shifted_window)
-            if cached_result is not None:
-                rows, start_date, end_date = cached_result
-            # matched_date가 없거나 lookback 상한을 넘으면 rows/기간은 나이브 값 그대로 —
-            # 기존과 동일하게 빈 결과 반환(에러 아님).
     finally:
         con.close()
 

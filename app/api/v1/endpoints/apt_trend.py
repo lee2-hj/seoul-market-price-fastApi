@@ -11,7 +11,9 @@ router = APIRouter(prefix="/apt-trend", tags=["apt-trend"])
 
 
 @router.get("/summary", response_model=AptTrendResponse)
-@cache(expire=300)  # DuckDB 마트 스캔이 5초 이상 걸려 nginx 499를 유발해, 5분간 응답을 인메모리 캐싱한다.
+# apt_mkt_trends 재귀 glob 전체 스캔이 캐시 미스 시 49초 가까이 걸려 nginx 499를 유발한다.
+# 아파트 시세 마트는 하루 1회만 갱신되므로 1시간(3600초) 동안은 응답을 그대로 재사용해도 무방하다.
+@cache(expire=3600)
 def get_apt_trend_summary(
     query: Annotated[AptTrendQuery, Query()],
 ) -> AptTrendResponse:
