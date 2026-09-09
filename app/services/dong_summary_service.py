@@ -71,7 +71,7 @@ def get_dong_summary(
         where_clause, where_params = _build_where_clause(region_cgg)
         base_date = duckdb_client.resolve_base_date_for_filter(
             con, MART_TABLE, where_clause, where_params
-        ) or duckdb_client.resolve_base_date(con, MART_TABLE)
+        ) or duckdb_client.resolve_base_date_cached(con, MART_TABLE)
         rows = _fetch_rows(con, base_date, region_cgg)
         if region_cgg:
             groups = _group_rows(rows, "stdg_cd", "stdg_nm")

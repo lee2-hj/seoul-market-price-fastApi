@@ -122,7 +122,7 @@ def get_top_bottom(
         where_clause, where_params = _build_where_clause(region_cgg_cd, region_stdg_cd)
         base_date = duckdb_client.resolve_base_date_for_filter(
             con, MART_TABLE, where_clause, where_params
-        ) or duckdb_client.resolve_base_date(con, MART_TABLE)
+        ) or duckdb_client.resolve_base_date_cached(con, MART_TABLE)
         row_count = _count_rows(con, base_date, region_cgg_cd, region_stdg_cd)
         top_items = _fetch_ranked(con, base_date, region_cgg_cd, region_stdg_cd, metric_type, "DESC")
         bottom_items = (

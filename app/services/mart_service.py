@@ -90,10 +90,10 @@ def compare_dong_pyeong(
         region2_where, region2_params = _build_where_clause(region2_cgg_cd, region2_stdg_cd)
         region1_base_date = duckdb_client.resolve_base_date_for_filter(
             con, MART_TABLE, region1_where, region1_params
-        ) or duckdb_client.resolve_base_date(con, MART_TABLE)
+        ) or duckdb_client.resolve_base_date_cached(con, MART_TABLE)
         region2_base_date = duckdb_client.resolve_base_date_for_filter(
             con, MART_TABLE, region2_where, region2_params
-        ) or duckdb_client.resolve_base_date(con, MART_TABLE)
+        ) or duckdb_client.resolve_base_date_cached(con, MART_TABLE)
         region1_items = _fetch_region_rows(con, region1_base_date, region1_cgg_cd, region1_stdg_cd)
         region2_items = _fetch_region_rows(con, region2_base_date, region2_cgg_cd, region2_stdg_cd)
         region1_summary = _fetch_region_summary(con, region1_base_date, region1_cgg_cd, region1_stdg_cd)

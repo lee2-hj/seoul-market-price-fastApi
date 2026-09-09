@@ -61,7 +61,7 @@ def _fetch_gold_items_with_retry(
         try:
             base_date = duckdb_client.resolve_base_date_for_filter(
                 con, mart_table, where_clause, params
-            ) or duckdb_client.resolve_base_date(con, mart_table)
+            ) or duckdb_client.resolve_base_date_cached(con, mart_table)
             parquet_glob = f"{duckdb_client.mart_base_path(mart_table)}/base_date={base_date}/*.parquet"
 
             query = f"""
@@ -136,7 +136,7 @@ def fetch_recent_supply_pyeong(
         try:
             base_date = duckdb_client.resolve_base_date_for_filter(
                 con, mart_table, where_clause, params
-            ) or duckdb_client.resolve_base_date(con, mart_table)
+            ) or duckdb_client.resolve_base_date_cached(con, mart_table)
             parquet_glob = f"{duckdb_client.mart_base_path(mart_table)}/base_date={base_date}/*.parquet"
 
             query = f"""

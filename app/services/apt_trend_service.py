@@ -111,7 +111,7 @@ def _fetch_rows(
     소요), 이 마트는 이미 최신 파티션 자체가 최근 90일치 롤링 윈도우를 담고 있으므로 최신 파티션
     하나만 읽으면 충분하다. 이 최신 파티션에도 조건에 맞는 데이터가 없으면 빈 결과를 그대로
     반환한다(과거 파티션/실버(Iceberg) 레이어까지 거슬러 올라가는 폴백은 없음)."""
-    latest_base_date = duckdb_client.resolve_base_date(con, MART_TABLE)
+    latest_base_date = duckdb_client.resolve_base_date_cached(con, MART_TABLE)
     parquet_glob = f"{duckdb_client.mart_base_path(MART_TABLE)}/base_date={latest_base_date}/*.parquet"
     where_clause, params = _build_where_clause(cgg_cd, stdg_cd, mno, sno, apt_name, start_date, end_date)
     query = f"""

@@ -218,7 +218,7 @@ def get_dashboard(*, cgg_cd: str | None) -> dict[str, Any]:
 
     con = duckdb_client.get_connection()
     try:
-        latest_base_date = duckdb_client.resolve_base_date(con, MART_TABLE)
+        latest_base_date = duckdb_client.resolve_base_date_cached(con, MART_TABLE)
 
         preference_where, preference_params = _build_preference_where_clause(resolved_cgg_cd)
         preference_base_date = duckdb_client.resolve_base_date_for_filter(

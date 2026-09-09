@@ -133,10 +133,10 @@ def compare_region_apts(
         where_2, params_2 = _build_where_clause(cgg_cd_2, bjd_cd_2, apt_nm_2, mno_2, sno_2)
         base_date_1 = duckdb_client.resolve_base_date_for_filter(
             con, MART_TABLE, where_1, params_1
-        ) or duckdb_client.resolve_base_date(con, MART_TABLE)
+        ) or duckdb_client.resolve_base_date_cached(con, MART_TABLE)
         base_date_2 = duckdb_client.resolve_base_date_for_filter(
             con, MART_TABLE, where_2, params_2
-        ) or duckdb_client.resolve_base_date(con, MART_TABLE)
+        ) or duckdb_client.resolve_base_date_cached(con, MART_TABLE)
         row_1 = _fetch_apt_row(con, base_date_1, cgg_cd_1, bjd_cd_1, apt_nm_1, mno_1, sno_1)
         row_2 = _fetch_apt_row(con, base_date_2, cgg_cd_2, bjd_cd_2, apt_nm_2, mno_2, sno_2)
     finally:

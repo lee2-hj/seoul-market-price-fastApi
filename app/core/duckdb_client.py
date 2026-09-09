@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 import duckdb
+from cachetools import TTLCache
 
 from app.core.config import settings
 
@@ -138,6 +139,45 @@ def resolve_base_date(con: duckdb.DuckDBPyConnection, mart_table: str) -> str:
         raise FileNotFoundError(f"'{mart_table}' 마트에서 조회 가능한 base_date 파티션을 찾을 수 없습니다.")
 
     return max_base_date.isoformat() if hasattr(max_base_date, "isoformat") else str(max_base_date)
+
+
+_base_date_cache: TTLCache = TTLCache(
+    maxsize=settings.base_date_cache_maxsize, ttl=settings.base_date_cache_ttl_seconds
+)
+_base_date_cache_lock = threading.Lock()
+_BASE_DATE_SENTINEL = object()
+
+
+def resolve_base_date_cached(con: duckdb.DuckDBPyConnection, mart_table: str) -> str:
+    """resolve_base_date()와 동일한 값(mart_table의 최신 base_date)을 반환하지만, mart_table별로
+    최대 settings.base_date_cache_ttl_seconds(기본 3600초=1시간) 동안 결과를 캐싱해 재계산을
+    건너뛴다.
+
+    resolve_base_date()는 hive_partitioning read_parquet로 마트 전체 이력(2023년부터 누적된
+    수백 개 parquet 파일)을 열어 MAX(base_date)를 집계하므로 캐시 미스 시 수십 초가 걸릴 수 있다.
+    이 마트들은 Airflow 배치로 하루 1회만 갱신되므로, 요청마다 이 무거운 스캔을 반복할 필요가
+    없다 - 1시간에 한 번만 재계산해도 최신 데이터 반영이 실질적으로 지연되지 않는다.
+
+    cachetools.TTLCache는 스레드-세이프하지 않으므로(FastAPI 동기 엔드포인트가 threadpool의
+    여러 스레드에서 동시 실행될 수 있음) Lock으로 감싸되, 실제 계산(resolve_base_date 호출)은
+    Lock 밖에서 수행해 느린 S3 스캔 동안 다른 요청이 캐시를 건드리지 못하는 상황을 피한다.
+    서로 다른 요청이 같은 미스 키를 동시에 계산하는 드문 cache stampede가 가능하지만, 계산 자체가
+    멱등이므로 결과 정합성에는 영향이 없다."""
+    with _base_date_cache_lock:
+        cached = _base_date_cache.get(mart_table, _BASE_DATE_SENTINEL)
+    if cached is not _BASE_DATE_SENTINEL:
+        return cached
+
+    value = resolve_base_date(con, mart_table)
+    with _base_date_cache_lock:
+        _base_date_cache[mart_table] = value
+    return value
+
+
+def clear_base_date_cache() -> None:
+    """테스트 격리 및 운영 중 강제 갱신을 위한 base_date 캐시 초기화."""
+    with _base_date_cache_lock:
+        _base_date_cache.clear()
 
 
 def resolve_base_date_for_filter(

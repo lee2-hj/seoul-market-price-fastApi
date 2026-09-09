@@ -13,7 +13,7 @@ def get_recent_changes() -> tuple[str, str | None, list[dict[str, Any]]]:
     직전 파티션이 없으면(파티션이 1개뿐) 조인 없이 최신 파티션 전체를 status='NEW'로 반환한다."""
     con = duckdb_client.get_connection()
     try:
-        base_date = duckdb_client.resolve_base_date(con, MART_TABLE)
+        base_date = duckdb_client.resolve_base_date_cached(con, MART_TABLE)
 
         all_dates = duckdb_client.list_base_dates(con, MART_TABLE)
         compared_base_date = all_dates[1] if len(all_dates) > 1 else None

@@ -43,5 +43,13 @@ class Settings(BaseSettings):
     # 시간이 거의 2배가 된다 - 원인 파악 후에는 반드시 False로 되돌릴 것.
     apt_trend_explain_analyze: bool = False
 
+    # duckdb_client.resolve_base_date()(마트별 최신 base_date를 찾기 위해 base_date=*/**/*.parquet를
+    # 재귀 스캔하는 MAX(base_date) 집계 쿼리)는 2023년부터 누적된 수백 개 parquet 파일을 열어야 해서
+    # 캐시 미스 시 수십 초가 걸릴 수 있다. 이 마트들은 Airflow로 하루 1회만 갱신되므로, 마트별 최신
+    # base_date 조회 결과를 이 시간(초) 동안 프로세스 메모리에 캐싱해 매 요청마다 재스캔하지 않는다
+    # (resolve_base_date_cached()).
+    base_date_cache_ttl_seconds: int = 3600
+    base_date_cache_maxsize: int = 256
+
 
 settings = Settings()
