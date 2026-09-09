@@ -122,23 +122,22 @@ def resolve_base_date(con: duckdb.DuckDBPyConnection, mart_table: str) -> str:
     오브젝트 스토리지(GCS의 S3 호환 API 등)의 목록 조회 결과에 실제 parquet 파일이 아닌 그 폴더
     "키" 자체가 섞여 들어오는 경우가 있고, 이를 실제 오브젝트인 것처럼 GET하려다 404가 난다.
 
-    그래서 특정 파티션 폴더를 콕 집어 존재 여부를 확인하는 대신, mart_table 전체를 재귀
-    와일드카드(`**/*.parquet`)로 read_parquet에 넘겨 hive_partitioning으로 노출되는 base_date
-    컬럼의 MAX 값을 SQL 집계로 직접 구한다. 이 경로는 실제로 열 수 있는 parquet 파일들만
-    대상으로 하므로 위 문제가 재현되지 않는다. '오늘 파티션 우선'이라는 과거 동작과 결과도
-    동일하다 - 정상적인 배치 파이프라인이라면 미래 날짜 파티션이 있을 수 없으므로, 오늘
-    파티션이 존재한다면 그것이 항상 전체 MAX와 같기 때문이다."""
-    recursive_pattern = f"{mart_base_path(mart_table)}/**/*.parquet"
-    row = con.execute(
-        "SELECT MAX(base_date) FROM read_parquet($pattern, hive_partitioning = true)",
-        {"pattern": recursive_pattern},
-    ).fetchone()
+    이 문제를 피하려고 한동안 mart_table 전체를 재귀 와일드카드(`**/*.parquet`)로 read_parquet에
+    넘겨 hive_partitioning으로 노출되는 base_date 컬럼의 MAX 값을 SQL 집계로 구했으나, 이 방식은
+    2023년부터 누적된 마트 전체의 parquet 파일을 전부 열어 실제 내용을 읽어야 해서(파일이 수백
+    개면) 캐시 미스 시 수십 초가 걸리는 것으로 확인됐다 - MAX(base_date) 하나를 구하려고 필요
+    이상의 데이터를 스캔하는 셈이다.
 
-    max_base_date = row[0] if row else None
-    if max_base_date is None:
-        raise FileNotFoundError(f"'{mart_table}' 마트에서 조회 가능한 base_date 파티션을 찾을 수 없습니다.")
-
-    return max_base_date.isoformat() if hasattr(max_base_date, "isoformat") else str(max_base_date)
+    그래서 list_base_dates()가 쓰는 것과 동일한 목록 조회 방식(`glob('.../base_date=*/*.parquet')`)
+    으로 전환한다. 이 glob은 파일 "내용"을 전혀 열지 않고 오브젝트 스토리지의 키 목록(경로 문자열)만
+    가져오므로 read_parquet 자체가 없다 - 위 404 버그와는 무관하다(그 버그는 "특정 파티션 폴더 하나를
+    glob으로 겨냥한 뒤 그 결과를 read_parquet로 실제로 여는" 조합에서만 발생했다). 게다가 이 패턴은
+    `*.parquet` 접미사로 끝나야 매칭되므로, 오브젝트 스토리지가 섞어 넣을 수 있는 폴더 "키"
+    자체(파일명이 아니라 폴더를 가리키는 마커, 보통 `/`로 끝남)는 애초에 패턴에 매칭되지 않아 걸러진다.
+    폴더명(파티션 키)에서 base_date 값을 문자열로 파싱하기만 하면 되므로 parquet 내용을 읽을 필요가
+    전혀 없다 - list_base_dates()가 내림차순 정렬까지 이미 해주므로 첫 번째 값을 그대로 반환한다."""
+    available_dates = list_base_dates(con, mart_table)
+    return available_dates[0]
 
 
 _base_date_cache: TTLCache = TTLCache(
