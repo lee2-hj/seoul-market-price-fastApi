@@ -11,7 +11,7 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 @router.get("", response_model=DashboardResponse)
-@cache(expire=300)  # DuckDB 마트 스캔이 5초 이상 걸려 nginx 499를 유발해, 5분간 응답을 인메모리 캐싱한다.
+@cache(expire=3600)  # DuckDB 마트 스캔(S3)이 캐시 미스 시 수십 초 걸려 nginx 499를 유발해, Airflow 일 1회 갱신 주기에 맞춰 1시간 인메모리 캐싱한다.
 def get_dashboard(
     query: Annotated[DashboardQuery, Query()],
 ) -> DashboardResponse:
