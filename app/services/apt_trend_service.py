@@ -98,6 +98,7 @@ def _log_explain_analyze(con, query: str, params: dict[str, Any]) -> None:
 
 def _fetch_rows(
     con,
+    base_date: str,
     cgg_cd: str | None,
     stdg_cd: str | None,
     mno: str | None,
@@ -106,13 +107,14 @@ def _fetch_rows(
     start_date: date,
     end_date: date,
 ) -> list[dict[str, Any]]:
-    """apt_mkt_trends 마트의 최신 base_date 파티션에서 필터 조건에 맞는 row를 조회한다. 과거에는
+    """apt_mkt_trends 마트의 지정된 base_date 파티션 하나에서 필터 조건에 맞는 row를 조회한다. 과거에는
     base_date 파티션 전체를 재귀 glob(`/**/*.parquet`)으로 스캔했으나(캐시 미스 시 49초 가까이
-    소요), 이 마트는 이미 최신 파티션 자체가 최근 90일치 롤링 윈도우를 담고 있으므로 최신 파티션
-    하나만 읽으면 충분하다. 이 최신 파티션에도 조건에 맞는 데이터가 없으면 빈 결과를 그대로
-    반환한다(과거 파티션/실버(Iceberg) 레이어까지 거슬러 올라가는 폴백은 없음)."""
-    latest_base_date = duckdb_client.resolve_base_date_cached(con, MART_TABLE)
-    parquet_glob = f"{duckdb_client.mart_base_path(MART_TABLE)}/base_date={latest_base_date}/*.parquet"
+    소요), 이 마트는 각 base_date 파티션 자체가 그 시점 기준 최근 90일치 롤링 윈도우를 담고
+    있으므로 파티션 하나만 읽으면 충분하다. 어느 base_date를 읽을지는 호출부
+    (get_apt_trend_summary)가 결정한다 - 최신 파티션에 매칭 데이터가 없으면 과거 base_date
+    파티션으로 폴백해(resolve_base_date_for_filter) 이 함수를 다시 호출할 수 있다(이 함수 자체는
+    폴백을 모른다)."""
+    parquet_glob = f"{duckdb_client.mart_base_path(MART_TABLE)}/base_date={base_date}/*.parquet"
     where_clause, params = _build_where_clause(cgg_cd, stdg_cd, mno, sno, apt_name, start_date, end_date)
     query = f"""
         SELECT
@@ -317,10 +319,17 @@ def get_apt_trend_summary(
     apt_name이 주어지면 실제 apt_name 컬럼을 SQL WHERE(ILIKE)에서 부분일치 필터링한다(다른 마트를
     조인하지 않는다).
 
-    이 90일 창(오늘 기준)에 조건에 맞는 거래가 하나도 없으면(apt_mkt_trends의 최신 base_date
-    파티션에 이 단지 데이터가 없는 경우), 과거 파티션이나 실버(fact_apt_transactions, Iceberg)
-    레이어로 거슬러 올라가지 않고 빈 결과를 그대로 반환한다(에러 아님) - 항상 최신 base_date
-    데이터만 조회한다.
+    최신 base_date 파티션(오늘 기준 최근 90일 롤링 윈도우)에 조건에 맞는 거래가 하나도 없으면,
+    날짜 조건을 뺀 단지 필터(cgg_cd/stdg_cd/mno/sno/apt_name)만으로 과거 base_date 파티션들을
+    최신순으로(최대 settings.max_base_date_lookback개) 훑어 조건에 매칭되는 가장 최근 파티션을
+    찾는다(duckdb_client.resolve_base_date_for_filter - 파티션당 가벼운 EXISTS 쿼리 1회, 매칭되면
+    즉시 조기 종료). 매칭되는 과거 파티션을 찾으면 그 base_date를 새 anchor로 삼아 90일 창 전체
+    (그 base_date - 90일 ~ 그 base_date)를 다시 조회한다 - 이 마트는 각 base_date 파티션 자체가
+    그 시점 기준 롤링 90일 윈도우이므로, 과거 파티션 폴백이 곧 "그 시점 기준 최근 90일" 재조회와
+    같다. lookback 내에 매칭되는 파티션이 없으면(또는 최신 파티션과 동일하면) 폴백하지 않고
+    기존처럼 빈 결과를 그대로 반환한다(에러 아님) - 실버(fact_apt_transactions, Iceberg)
+    레이어까지 거슬러 올라가는 폴백은 없다. 폴백이 발생하면 search_period.start_date/end_date는
+    "오늘 기준 90일"이 아니라 실제 사용된 base_date 기준 구간을 반영한다.
 
     count_change_rate는 biweekly_trend(90일을 6구간으로 균등 분할한 거래량)에서 거래가 있는
     구간끼리만 순서대로 짝지어(0건 구간은 짝짓기에서 제외) 증감률을 계산하고, 각 스텝 뒤쪽 구간의
@@ -329,7 +338,35 @@ def get_apt_trend_summary(
     start_date, end_date = _period_range(date.today())
     con = duckdb_client.get_connection()
     try:
-        rows = _fetch_rows(con, cgg_cd, stdg_cd, mno, sno, apt_name, start_date, end_date)
+        latest_base_date = duckdb_client.resolve_base_date_cached(con, MART_TABLE)
+        rows = _fetch_rows(con, latest_base_date, cgg_cd, stdg_cd, mno, sno, apt_name, start_date, end_date)
+
+        if not rows:
+            naive_start, naive_end = start_date, end_date
+            entity_conditions, entity_params = _build_entity_conditions(cgg_cd, stdg_cd, mno, sno, apt_name)
+            entity_where = ("WHERE " + " AND ".join(entity_conditions)) if entity_conditions else ""
+            fallback_base_date = duckdb_client.resolve_base_date_for_filter(
+                con, MART_TABLE, entity_where, entity_params, max_lookback=settings.max_base_date_lookback
+            )
+            if fallback_base_date is not None and fallback_base_date != latest_base_date:
+                end_date = date.fromisoformat(fallback_base_date)
+                start_date = end_date - timedelta(days=PERIOD_DAYS)
+                rows = _fetch_rows(
+                    con, fallback_base_date, cgg_cd, stdg_cd, mno, sno, apt_name, start_date, end_date
+                )
+                logger.info(
+                    "Base-date fallback used for table=%s, condition_summary=%s, "
+                    "naive_window=%s~%s, matched_base_date=%s, matched_window=%s~%s",
+                    MART_TABLE,
+                    (entity_where or "(no filter)")[:100],
+                    naive_start,
+                    naive_end,
+                    fallback_base_date,
+                    start_date,
+                    end_date,
+                )
+            # fallback_base_date가 None이거나(=lookback 내 매칭 파티션 없음) latest_base_date와
+            # 같으면(이미 확인한 파티션) rows/기간은 나이브 값 그대로 - 빈 결과 반환(에러 아님).
     finally:
         con.close()
 

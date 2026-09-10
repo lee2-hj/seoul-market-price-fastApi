@@ -1,7 +1,12 @@
 """apt_trend_service 회귀 테스트.
 
-1. get_apt_trend_summary()는 항상 apt_mkt_trends의 최신 base_date 데이터만 사용한다(과거
-   파티션/실버(fact_apt_transactions) 레이어로 거슬러 올라가는 폴백은 없음).
+1. get_apt_trend_summary()는 최신 base_date 파티션에 조건 매칭 데이터가 없으면, 날짜 조건을 뺀
+   단지 필터(cgg_cd/stdg_cd/mno/sno/apt_name)만으로 과거 base_date 파티션을 훑어
+   (resolve_base_date_for_filter) 매칭되는 가장 최근 파티션으로 폴백한다(그 base_date를 새
+   anchor로 90일 창 전체를 다시 조회). lookback 내에 매칭 파티션이 없으면 기존처럼 빈 결과를
+   그대로 반환한다(에러 아님). (실사용 리포트 재현: /apt-trend/summary?cgg_cd=11170&stdg_cd=13000
+   &mno=0730&sno=0000&apt_name=이태원(이테크빌) — 거래 빈도가 낮아 naive 90일 창엔 안 걸리지만
+   과거엔 거래가 있어 폴백 없이는 항상 빈 결과였던 회귀 케이스.)
 2. _build_count_change_rate()의 표본 부족 필터링(MIN_TRADE_COUNT) 제거 이후 동작
    (backend-apt-trend-count-change-rate-fix 계획서 Phase 4 테스트 케이스).
 3. _build_count_change_rate()의 0건 구간 짝짓기 제외(있는 데이터끼리만 비교) 회귀 테스트 -
@@ -16,12 +21,20 @@ from app.services import apt_trend_service
 
 
 # ---------------------------------------------------------------------------
-# get_apt_trend_summary: 최신 base_date만 사용(폴백 없음)
+# get_apt_trend_summary: base_date 폴백(resolve_base_date_for_filter)
 # ---------------------------------------------------------------------------
 
 
-def test_get_apt_trend_summary_keeps_empty_result_when_no_match_at_all(monkeypatch):
+def test_get_apt_trend_summary_keeps_empty_result_when_no_partition_matches_at_all(monkeypatch):
+    """최신 파티션에도, lookback 내 과거 파티션 어디에도 조건 매칭 데이터가 없으면
+    (resolve_base_date_for_filter -> None) 빈 결과를 그대로 반환해야 한다(에러 아님)."""
     monkeypatch.setattr(apt_trend_service.duckdb_client, "get_connection", lambda: MagicMock())
+    monkeypatch.setattr(
+        apt_trend_service.duckdb_client, "resolve_base_date_cached", lambda *a, **k: "2026-09-08"
+    )
+    monkeypatch.setattr(
+        apt_trend_service.duckdb_client, "resolve_base_date_for_filter", lambda *a, **k: None
+    )
     monkeypatch.setattr(apt_trend_service, "_fetch_rows", lambda *a, **k: [])
 
     result = apt_trend_service.get_apt_trend_summary(
@@ -30,6 +43,82 @@ def test_get_apt_trend_summary_keeps_empty_result_when_no_match_at_all(monkeypat
 
     assert result["count"] == 0
     assert result["data"] == []
+
+
+def test_get_apt_trend_summary_falls_back_to_past_base_date_when_naive_window_empty(monkeypatch):
+    """실사용 리포트 재현: 최신 파티션(naive, 오늘 기준 90일)엔 조건 매칭 데이터가 없고 과거
+    base_date 파티션에만 있으면, 그 base_date를 새 anchor로 삼아 재조회해야 한다(거래 빈도가 낮은
+    단지가 naive 90일 창엔 안 걸리지만 과거엔 거래가 있는 케이스 - 폴백 없이는 항상 빈 결과)."""
+    row = {
+        "cgg_cd": "11170",
+        "cgg_nm": "용산구",
+        "stdg_cd": "13000",
+        "stdg_nm": "이태원동",
+        "apt_name": "이태원(이테크빌)",
+        "mno": "0730",
+        "sno": "0000",
+        "deal_date": "2026-06-01",
+        "floor": 5,
+        "trade_amount": 50000,
+        "pyeong": 20,
+        "trade_count": 1,
+    }
+    monkeypatch.setattr(apt_trend_service.duckdb_client, "get_connection", lambda: MagicMock())
+    monkeypatch.setattr(
+        apt_trend_service.duckdb_client, "resolve_base_date_cached", lambda *a, **k: "2026-09-08"
+    )
+    monkeypatch.setattr(
+        apt_trend_service.duckdb_client, "resolve_base_date_for_filter", lambda *a, **k: "2026-06-15"
+    )
+
+    calls: list[str] = []
+
+    def fake_fetch_rows(con, base_date, *args, **kwargs):
+        calls.append(base_date)
+        return [row] if base_date == "2026-06-15" else []
+
+    monkeypatch.setattr(apt_trend_service, "_fetch_rows", fake_fetch_rows)
+
+    result = apt_trend_service.get_apt_trend_summary(
+        cgg_cd="11170", stdg_cd="13000", mno="0730", sno="0000", apt_name="이태원(이테크빌)"
+    )
+
+    assert calls == ["2026-09-08", "2026-06-15"]
+    assert result["count"] == 1
+    assert result["search_period"]["end_date"].isoformat() == "2026-06-15"
+
+
+def test_get_apt_trend_summary_fallback_where_clause_has_no_date_condition(monkeypatch):
+    """resolve_base_date_for_filter에는 날짜 조건 없이 단지 필터만 전달돼야 한다 - 과거 파티션은
+    그 시점 기준 90일 윈도우라 naive 날짜 범위로 존재 확인하면 실제로 있는 데이터도 놓친다."""
+    captured: dict = {}
+
+    def fake_resolve_for_filter(con, mart_table, where_sql, params, **kwargs):
+        captured["where_sql"] = where_sql
+        captured["params"] = params
+        return None
+
+    monkeypatch.setattr(apt_trend_service.duckdb_client, "get_connection", lambda: MagicMock())
+    monkeypatch.setattr(
+        apt_trend_service.duckdb_client, "resolve_base_date_cached", lambda *a, **k: "2026-09-08"
+    )
+    monkeypatch.setattr(
+        apt_trend_service.duckdb_client, "resolve_base_date_for_filter", fake_resolve_for_filter
+    )
+    monkeypatch.setattr(apt_trend_service, "_fetch_rows", lambda *a, **k: [])
+
+    apt_trend_service.get_apt_trend_summary(
+        cgg_cd="11170", stdg_cd="13000", mno="0730", sno="0000", apt_name="이태원(이테크빌)"
+    )
+
+    assert "deal_date" not in captured["where_sql"]
+    assert captured["params"] == {
+        "cgg_cd": "11170",
+        "stdg_cd": "13000",
+        "mno": "0730",
+        "sno": "0000",
+        "apt_name": "%이태원(이테크빌)%",
+    }
 
 
 # ---------------------------------------------------------------------------
