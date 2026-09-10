@@ -365,6 +365,21 @@ def get_apt_trend_summary(
                     start_date,
                     end_date,
                 )
+            elif fallback_base_date == latest_base_date:  # ← 여기서부터 추가
+                parquet_glob = f"{duckdb_client.mart_base_path(MART_TABLE)}/base_date={latest_base_date}/*.parquet"
+                latest_deal = duckdb_client.resolve_recent_match_date(
+                    con, parquet_glob, "deal_date", entity_where, entity_params
+                )
+                if latest_deal is not None:
+                    end_date = latest_deal
+                    start_date = end_date - timedelta(days=PERIOD_DAYS)
+                    rows = _fetch_rows(
+                        con, latest_base_date, cgg_cd, stdg_cd, mno, sno, apt_name, start_date, end_date
+                    )
+                    logger.info(
+                        "Deal-date window shifted: table=%s, latest_deal=%s, shifted_window=%s~%s",
+                        MART_TABLE, latest_deal, start_date, end_date,
+                    )
             # fallback_base_date가 None이거나(=lookback 내 매칭 파티션 없음) latest_base_date와
             # 같으면(이미 확인한 파티션) rows/기간은 나이브 값 그대로 - 빈 결과 반환(에러 아님).
     finally:
